@@ -1,0 +1,982 @@
+"""
+monitor.py — Gazette & News Monitor core engine
+================================================
+Usage:
+    python monitor.py docsp    # Diário Oficial da Cidade de SP
+    python monitor.py doesp    # Diário Oficial do Estado de SP
+    python monitor.py dou      # Diário Oficial da União
+
+Configuration lives entirely in configs/<source_id>.py.
+This file contains only generic logic — never edit it per source.
+"""
+
+import sys
+import importlib
+import requests
+import datetime
+import os
+import re
+import unicodedata
+import io
+import time
+
+# ---------------------------------------------------------------------------
+# Load configuration from command-line argument
+# ---------------------------------------------------------------------------
+SOURCE_ID = sys.argv[1] if len(sys.argv) > 1 else "docsp"
+try:
+    _cfg = importlib.import_module(f"configs.{SOURCE_ID}")
+    SOURCE_CONFIG     = _cfg.SOURCE_CONFIG
+    KEYWORD_CATEGORIES = _cfg.KEYWORD_CATEGORIES
+    KEYWORD_FILTERS   = _cfg.KEYWORD_FILTERS
+except ImportError as e:
+    print(f"❌ Config not found for source '{SOURCE_ID}': {e}")
+    print(f"   Available: configs/docsp.py, configs/doesp.py, configs/dou.py")
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Telegram credentials — one pair per bot, named by source ID
+# ---------------------------------------------------------------------------
+# GitHub secrets naming convention:
+#   DOCSP_TOKEN / DOCSP_CHAT_ID
+#   DOESP_TOKEN / DOESP_CHAT_ID
+#   DOU_TOKEN   / DOU_CHAT_ID
+_sid = SOURCE_ID.upper()
+TELEGRAM_TOKEN = os.getenv(f"{_sid}_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+CHAT_ID        = os.getenv(f"{_sid}_CHAT_ID") or os.getenv("CHAT_ID")
+
+if not TELEGRAM_TOKEN or not CHAT_ID:
+    print(f"🚨 FATAL: {_sid}_TOKEN or {_sid}_CHAT_ID secrets are missing.")
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+WINDOW_SIDE = 1500
+TG_MAX      = 4000
+
+KEYWORDS = sorted(KEYWORD_CATEGORIES.keys(), key=len, reverse=True)
+
+CATEGORY_ICONS = {
+    "contract":       "📝",
+    "procurement":    "🛒",
+    "budget":         "💼",
+    "personnel":      "👤",
+    "penalty":        "⚖️",
+    "legal":          "🏛️",
+    "infrastructure": "🏗️",
+    "investigative":  "🔎",
+    # Thematic categories
+    "educacao":       "🎓",
+    "saude":          "🏥",
+    "seguranca":      "🚔",
+    "obras":          "🏗️",
+    "meio_ambiente":  "🌿",
+    "social":         "🤝",
+    "general":        "🔍",
+}
+
+# ===========================================================================
+# JOURNALISTIC THEME INFERENCE
+# ---------------------------------------------------------------------------
+# Each match is tagged with a journalistic theme based on the organs /
+# secretarias mentioned in the window. This is independent of the
+# administrative category — a contract (category) can be about health (theme).
+# ===========================================================================
+JOURNALIST_THEMES = {
+    "educacao": {
+        "label": "Educação",
+        "emoji": "🎓",
+        "patterns": [
+            r'educa[çc][aã]o|SME\b|escola|ensino\s+(?:público|médio|fundamental)|'
+            r'CEU\b|merenda|estudante|professor|aluno|FNDE\b|MEC\b|SEE\b',
+        ],
+    },
+    "saude": {
+        "label": "Saúde",
+        "emoji": "🏥",
+        "patterns": [
+            r'sa[úu]de|SMS\b|SES\b|MS\b|hospital|UBS\b|AMA\b|médic|farmác|'
+            r'ambulat|ANVISA|pronto.socorro|UTI\b|leito|medicamento|enfermagem',
+        ],
+    },
+    "seguranca": {
+        "label": "Segurança Pública",
+        "emoji": "🚔",
+        "patterns": [
+            r'seguran[çc]a\s+p[úu]blica|SMSU\b|GCM\b|SSP\b|pol[ií]cia|'
+            r'penit[ea]nci[áa]ria|presídio|delegacia|DEIC\b|PRF\b|PF\b|'
+            r'crime|tráfico|feminicídio|homicídio',
+        ],
+    },
+    "obras": {
+        "label": "Obras e Infraestrutura",
+        "emoji": "🏗️",
+        "patterns": [
+            r'SIURB|SP.Obras|obra[s\s]|constru[çc][aã]o|pavimenta[çc][aã]o|'
+            r'saneamento|drenagem|concess[aã]o\s+(?:rodovi|metro|ferr)|'
+            r'habitação|CDHU\b|DER\b|DERSA\b|DNIT\b|PAC\b',
+        ],
+    },
+    "meio_ambiente": {
+        "label": "Meio Ambiente",
+        "emoji": "🌿",
+        "patterns": [
+            r'meio.ambiente|ambiental|SVMA\b|IBAMA\b|ICMBio\b|CETESB\b|'
+            r'SIMA\b|parque\s+(?:estadual|nacional|municipal)|'
+            r'área\s+de\s+preservação|desmatamento|polui[çc][aã]o|'
+            r'resíduo[s\s]|licen[çc]a\s+ambiental',
+        ],
+    },
+    "social": {
+        "label": "Assistência Social",
+        "emoji": "🤝",
+        "patterns": [
+            r'assistência\s+social|SMADS\b|SEDS\b|habitação\s+de\s+interesse|'
+            r'acolhimento|vulnerabilidade\s+social|BPC\b|Bolsa\s+Família|'
+            r'CRAS\b|CREAS\b|pessoa\s+em\s+situação\s+de\s+rua',
+        ],
+    },
+    "transparencia": {
+        "label": "Transparência/Anticorrupção",
+        "emoji": "🔍",
+        # Always tagged for investigative keywords — no need for pattern check
+        "always_tag_categories": ["investigative"],
+    },
+}
+
+def infer_theme(window: str, fields: dict, category: str) -> dict | None:
+    """
+    Infer the journalistic theme from the content window and extracted fields.
+    Returns a theme dict or None if no theme is detected.
+    """
+    # Always tag investigative category as transparency
+    for tid, theme in JOURNALIST_THEMES.items():
+        if category in theme.get("always_tag_categories", []):
+            return {"id": tid, **{k: v for k, v in theme.items() if k != "always_tag_categories"}}
+
+    # Pattern matching against window + field values
+    search_text = window + " " + " ".join(
+        str(v) for v in fields.values() if v
+    )
+    for tid, theme in JOURNALIST_THEMES.items():
+        for pattern in theme.get("patterns", []):
+            if re.search(pattern, search_text, re.IGNORECASE):
+                return {"id": tid, **{k: v for k, v in theme.items() if k != "patterns"}}
+
+    # Theme comes directly from the keyword's category
+    category_to_theme = {
+        "educacao":    "educacao",
+        "saude":       "saude",
+        "seguranca":   "seguranca",
+        "obras":       "obras",
+        "meio_ambiente": "meio_ambiente",
+        "social":      "social",
+    }
+    if category in category_to_theme:
+        tid = category_to_theme[category]
+        t   = JOURNALIST_THEMES[tid]
+        return {"id": tid, "label": t["label"], "emoji": t["emoji"]}
+
+    return None
+
+# ===========================================================================
+# HELPERS
+# ===========================================================================
+def normalize(text: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
+
+def parse_brl(value_str: str) -> float:
+    if not value_str: return 0.0
+    m = re.search(r'R\$\s*([\d.,]+)', value_str, re.IGNORECASE)
+    if not m: return 0.0
+    s = re.sub(r'\.(?=\d{3}(\D|$))', '', m.group(1)).replace(',', '.')
+    try: return float(s)
+    except ValueError: return 0.0
+
+# ===========================================================================
+# TELEGRAM
+# ===========================================================================
+def send_telegram(message: str, silent: bool = False) -> bool:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, json={
+            "chat_id": CHAT_ID, "text": message,
+            "parse_mode": "Markdown", "disable_web_page_preview": True,
+            "disable_notification": silent,
+        }, timeout=10)
+        if r.status_code == 200:
+            print("  ✅ Telegram OK"); return True
+        print(f"  🚨 {r.status_code}: {r.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"  🚨 {e}"); return False
+
+def send_pdf(pdf_bytes: bytes, caption: str) -> bool:
+    if not pdf_bytes:
+        return False
+    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+    name = f"{SOURCE_ID}_{datetime.date.today().strftime('%Y-%m-%d')}.pdf"
+    try:
+        r = requests.post(url,
+            files={"document": (name, pdf_bytes, "application/pdf")},
+            data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "Markdown"},
+            timeout=180)
+        if r.status_code == 200:
+            print("  ✅ PDF sent"); return True
+        print(f"  🚨 PDF failed {r.status_code}: {r.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"  🚨 PDF exception: {e}"); return False
+
+def send_message_parts(parts: list):
+    for part in parts:
+        send_telegram(part)
+        time.sleep(0.6)
+
+def split_into_parts(header: str, blocks: list, footer: str = "",
+                     kw: str = "", total_hits: int = 0) -> list:
+    messages  = []
+    current   = header
+    part_num  = 1
+    cat       = KEYWORD_CATEGORIES.get(kw, "general")
+    icon      = CATEGORY_ICONS.get(cat, "🔍")
+    src       = SOURCE_CONFIG["short_name"]
+    # Extract date from first line of header
+    date_line = header.split("\n")[0]
+
+    for block in blocks:
+        if len(current + "\n" + block) + len(footer) > TG_MAX:
+            messages.append(current)
+            part_num += 1
+            current = (
+                f"{date_line}\n"
+                f"{icon} 🔍 *Busca: {kw.upper()}* "
+                f"_{part_num}ª parte — {total_hits} total_\n"
+                + block
+            )
+        else:
+            current = current + "\n" + block
+
+    if current.strip():
+        messages.append(current + ("\n" + footer if footer else ""))
+
+    return messages
+
+# ===========================================================================
+# REGEX
+# ===========================================================================
+_RE_MONEY    = re.compile(r'R\$\s*[\d.,]+(?:\s*\([^)]{0,80}\))?', re.IGNORECASE)
+_RE_CNPJ     = re.compile(r'\d{2}[\.\s]?\d{3}[\.\s]?\d{3}[/\s]?\d{4}[-\s]?\d{2}')
+_RE_RF       = re.compile(r'R\.?F\.?[:\s]*[\d.]+(?:/\d+)?', re.IGNORECASE)
+_RE_DATE     = re.compile(r'\b\d{2}/\d{2}/\d{4}\b|\b\d{1,2}\s+de\s+\w+\s+de\s+\d{4}\b', re.IGNORECASE)
+_RE_PROCESS  = re.compile(r'(?:processo|SEI|proc\.?)\s*[snº°.]*\s*[\d./-]{6,}', re.IGNORECASE)
+_RE_CONTRACT = re.compile(r'(?:contrato|termo)\s*[nº°.]*\s*[\w/.-]+', re.IGNORECASE)
+
+_RE_COMPANY_LABELED = re.compile(
+    r'(?:'
+    r'APLICO\s+[àa]\s+(?:empresa\s+|Empresa\s+)'
+    r'|CONTRATAD[AO]:\s+|Contratad[ao]:\s+'
+    r'|(?:empresa|Empresa)\s+'
+    r'|Infrator:\s+|INTERESSAD[AO]:\s+|Interessad[ao]:\s+'
+    r'|em\s+nome\s+de\s+|em\s+favor\s+de\s+'
+    r'|NOTIFICO\s+a\s+empresa\s+'
+    r')'
+    r'([A-Za-záéíóúàâêîôûãõçÁÉÍÓÚÀÂÊÎÔÛÃÕÇ][^,\n─│|]{4,100}?'
+    r'(?:LTDA|S/?A|EIRELI|ME|EPP|Ltda\.?|S\.A\.?|Eireli|'
+    r'COOPERATIVA|ASSOCIAÇÃO|FUNDAÇÃO)\.?)',
+    re.IGNORECASE | re.UNICODE
+)
+
+_RE_COMPANY_CAPS = re.compile(
+    r'([A-ZÁÉÍÓÚÀÂÊÎÔÛÃÕÇ][A-ZÁÉÍÓÚÀÂÊÎÔÛÃÕÇ\s&,./()-]{8,80}'
+    r'(?:LTDA|S/?A|EIRELI|ME|EPP|SERVIÇOS|PRODUÇÕES|CONSTRUÇÕES|'
+    r'CONSULTORIA|ENGENHARIA|EMPREENDIMENTOS|ASSOCIAÇÃO|FUNDAÇÃO|INSTITUTO)\.?)',
+    re.UNICODE
+)
+
+_COMPANY_NOISE_STARTS = {
+    'EXTRATO','OBJETO','SUPERVISÃO','DEPARTAMENTO','CLÁUSULA','DOTAÇÃO',
+    'PROCESSO','PRINCIPAL','ITEM','ARTIGO','DIVISÃO','COORDENADORIA',
+    'SECRETARIA','PREFEITURA','DIRETORIA','GERÊNCIA','ASSESSORIA','COMISSÃO',
+    'SUBPREFEITURA','NÚCLEO','SEÇÃO','UNIDADE','GABINETE','CHEFIA',
+    'CONTRATANTE','CONTRATADA','PARTE','ORDEM','REGISTRO','TERMO','AUTO',
+    'RETIRADA','COMUNICADO','DESPACHO','PORTARIA','DECRETO','RESOLUÇÃO',
+}
+
+_LABELED_NOISE_STARTS = {
+    'empresa','contratada','contratado','interessada','interessado',
+    'vossa','senhoria','para','de','do','da','que','a','o',
+    'notificada','notificado','aplico','notifico',
+}
+
+def get_company(window: str) -> str | None:
+    for m in _RE_COMPANY_LABELED.finditer(window):
+        name = m.group(1).strip().rstrip('.,; ')
+        if len(name) < 8: continue
+        first = name.split()[0].lower().rstrip('.,:-')
+        if first in _LABELED_NOISE_STARTS: continue
+        if re.match(r'(?:para|de\s|do\s|da\s|que\s)', name, re.IGNORECASE): continue
+        return name
+    for m in _RE_COMPANY_CAPS.finditer(window):
+        name  = m.group(0).strip()
+        first = re.split(r'[\s\-]', name)[0].rstrip('.,:-')
+        if first.upper() not in _COMPANY_NOISE_STARTS:
+            return name
+    return None
+
+def get_secretaria(window: str) -> str | None:
+    full = re.search(
+        r'Secretaria\s+(?:Municipal|Estadual|de\s+Estado)\s+(?:d[aeo]\s+)?'
+        r'([A-Za-záéíóúàâêîôûãõçÁÉÍÓÚÀÂÊÎÔÛÃÕÇ][^\n│─|,]{3,60}?)'
+        r'(?=\s*[-\n│─|,]|$)', window, re.IGNORECASE)
+    if full:
+        return f"Secretaria de {full.group(1).strip()}"
+    hosp = re.search(r'Hospital\s+(?:Municipal|Estadual|Geral|de\s+Clínicas)\s+[^\n│─|,]{3,50}',
+                     window, re.IGNORECASE)
+    if hosp: return hosp.group(0).strip()
+    abbr = re.search(
+        r'\b(SM(?:DH[C]?|SU?B?|UL?|E|C|F|G|Z?[A-Z]{1,4})|SGM|SEGES|'
+        r'SP\-Regula|AMLURB|PRODAM|CET|COHAB|HSPM|SSP|SES|SEE|SEDS|SIMA)\b', window)
+    if abbr: return abbr.group(1)
+    return None
+
+def get_person_name(window: str, action: str = "generic") -> str | None:
+    caps = re.search(
+        r'(?:EXONERANDO|NOMEANDO|EXONERO|NOMEAR?|DEMITINDO|DEMITO)'
+        r'[^:]{0,60}:\s*'
+        r'([A-ZÁÉÍÓÚÀÂÊÎÔÛÃÕÇ][A-ZÁÉÍÓÚÀÂÊÎÔÛÃÕÇ\s]{5,60}?)'
+        r'(?=\s+R\.?F\.?|\s*-\s*R\.?F\.?|\s+RF\b)',
+        window, re.IGNORECASE | re.UNICODE)
+    if caps: return caps.group(1).strip()
+
+    table = re.search(
+        r'RF/VINC\s+NOME\s+CARGO\s+\S+\s+'
+        r'([A-ZÁÉÍÓÚÀÂÊÎÔÛÃÕÇ][A-ZÁÉÍÓÚÀÂÊÎÔÛÃÕÇ\s]{5,60}?)\s',
+        window, re.IGNORECASE | re.UNICODE)
+    if table: return table.group(1).strip()
+
+    if action in ("demissao", "generic"):
+        rescisao = re.search(
+            r'RESCINDO\s+o\s+contrato\s+do\s+Sr\.?\s+'
+            r'([A-ZÁÉÍÓÚÀÂÊÎÔÛÃÕÇ][a-záéíóúàâêîôûãõç\s]{5,60}?)'
+            r'(?=,|\s+portador|\s+inscrito|\s+CPF)',
+            window, re.IGNORECASE | re.UNICODE)
+        if rescisao: return rescisao.group(1).strip()
+
+    mixed = re.search(
+        r'(?:servidor[a]?|senhor[a]?|interessad[ao])[:\s]+'
+        r'([A-ZÁÉÍÓÚÀÂÊÎÔÛÃÕÇ][a-záéíóúàâêîôûãõç\s]{5,60}?)'
+        r'(?:\s*[-,]|\s*R\.?F\.?|\s*-\s*RF)',
+        window, re.IGNORECASE | re.UNICODE)
+    if mixed: return mixed.group(1).strip()
+    return None
+
+def first(pattern, text, group=0):
+    m = pattern.search(text)
+    return m.group(group).strip() if m else None
+
+# ===========================================================================
+# FIELD EXTRACTION
+# ===========================================================================
+def extract_fields(window: str, category: str, keyword: str = "") -> dict:
+    fields = {}
+
+    if category == "contract":
+        fields["💰 Valor"]        = first(_RE_MONEY, window)
+        fields["🏢 Empresa"]      = get_company(window)
+        fields["📄 Contrato"]     = first(_RE_CONTRACT, window)
+        date_ctx = re.search(
+            r'(?:vig[êe]ncia|prazo|prorroga[çc][aã]o|partir de|at[eé]|término)'
+            r'.{0,100}?(\d{2}/\d{2}/\d{4})', window, re.IGNORECASE)
+        fields["📅 Vigência"]     = date_ctx.group(1) if date_ctx else first(_RE_DATE, window)
+        prazo = re.search(
+            r'(?:Prazo\s+do\s+Contrato\s+(\d+)\s+Tipo\s+do\s+Prazo\s+(\w+))'
+            r'|(?:vig[êe]ncia\s+de\s+(\d+)\s*\(?\w*\)?\s*(m[êe]s(?:es)?|dias?|anos?))',
+            window, re.IGNORECASE)
+        if prazo:
+            g = prazo.groups()
+            fields["⏱️ Prazo"] = f"{g[0]} {g[1]}" if g[0] else f"{g[2]} {g[3]}"
+        assin = re.search(r'Data\s+da\s+Assinatura\s+(\d{2}/\d{2}/\d{4})', window, re.IGNORECASE)
+        fields["✍️ Assinatura"]   = assin.group(1) if assin else None
+        fields["🔖 Processo"]     = first(_RE_PROCESS, window)
+        obj = re.search(r'(?:objeto[:\s]+)(.{10,150}?)(?:\.|$)', window, re.IGNORECASE)
+        fields["📦 Objeto"]       = obj.group(1).strip() if obj else None
+
+    elif category == "procurement":
+        fields["💰 Valor"]    = first(_RE_MONEY, window)
+        fields["🏢 Empresa"]  = get_company(window)
+        fields["📄 CNPJ"]     = first(_RE_CNPJ, window)
+        fields["🔖 Processo"] = first(_RE_PROCESS, window)
+        fund = re.search(
+            r'art(?:igo)?\.?\s*(\d+),?\s*(?:inciso\s+|inc\.?\s*)?([IVX]+)?\s*'
+            r'(?:da|do)\s+Lei\s+(?:Federal\s+)?(?:n[°º.]\s*)?([\d.]+(?:/\d+)?)',
+            window, re.IGNORECASE)
+        if fund:
+            parts = [f"art. {fund.group(1)}"]
+            if fund.group(2): parts.append(fund.group(2))
+            if fund.group(3): parts.append(f"Lei {fund.group(3)}")
+            fields["📋 Fundamento"] = " — ".join(parts)
+        obj = re.search(r'(?:objeto[:\s]+|contrata[çc][aã]o\s+de\s+)(.{10,150}?)(?:\.|,|$)',
+                        window, re.IGNORECASE)
+        fields["📦 Objeto"] = obj.group(1).strip() if obj else None
+
+    elif category == "budget":
+        fields["💰 Valor"] = first(_RE_MONEY, window)
+        fields["📅 Data"]  = first(_RE_DATE, window)
+        decree = re.search(r'(DECRETO|PORTARIA|MEDIDA\s+PROVISÓRIA)\s+[Nnº°.]*\s*([\d.,/]+)',
+                           window, re.IGNORECASE)
+        fields["📜 Instrumento"] = f"{decree.group(1).upper()} Nº {decree.group(2).strip()}" if decree else None
+        dest = re.search(
+            r'(?:atividades\s+da(?:\(o\))?\s+)'
+            r'(Secretaria[^,\n.─]{5,80}|Ministério[^,\n.─]{5,60}|Instituto[^,\n.─]{5,60})',
+            window, re.IGNORECASE)
+        fields["🏛️ Órgão"] = dest.group(1).strip() if dest else get_secretaria(window)
+
+    elif category == "personnel":
+        kw_norm = normalize(keyword)
+        action = ("exoneracao" if any(x in kw_norm for x in ("exoneração", "demissão"))
+                  else "afastamento" if "afastamento" in kw_norm
+                  else "nomeacao")
+        fields["👤 Servidor"] = get_person_name(window, action)
+        fields["🪪 RF"]       = first(_RE_RF, window)
+        cargo = re.search(
+            r'(?:cargo\s+de|fun[çc][aã]o\s+de|no\s+cargo|CARGO:)[:\s]+'
+            r'(.{5,80}?)(?:\.|,|;|$|\s+pad)', window, re.IGNORECASE)
+        fields["💼 Cargo"]    = cargo.group(1).strip() if cargo else None
+        fields["🏛️ Órgão"]   = get_secretaria(window)
+        if "afastamento" in kw_norm:
+            period = re.search(r'(?:per[ií]odo|de\s+\d{2}/\d{2}).{0,80}?\d{2}/\d{2}/\d{4}',
+                               window, re.IGNORECASE)
+            fields["📅 Período"] = period.group(0).strip() if period else first(_RE_DATE, window)
+            dest = re.search(r'(?:miss[aã]o|evento|congresso|curso).{0,20}(.{5,100}?)(?:\.|$)',
+                             window, re.IGNORECASE)
+            fields["✈️ Destino"] = dest.group(1).strip() if dest else None
+        else:
+            fields["📅 Data"] = first(_RE_DATE, window)
+        if "exoneração" in kw_norm:
+            if re.search(r'a\s+pedido', window, re.IGNORECASE):
+                fields["📋 Tipo"] = "A PEDIDO"
+            elif re.search(r'est[aá]gio\s+probat[oó]rio', window, re.IGNORECASE):
+                fields["📋 Tipo"] = "ESTÁGIO PROBATÓRIO"
+            elif re.search(r'disciplinar|infr[ia]ngiu', window, re.IGNORECASE):
+                fields["📋 Tipo"] = "DISCIPLINAR"
+
+    elif category == "penalty":
+        tipo = re.search(
+            r'(?:pena(?:lidade)?\s+de\s+|APLICO\s+a\s+pena\s+de\s+)'
+            r'(MULTA|ADVERTÊNCIA|SUSPENSÃO|IMPEDIMENTO|RESCISÃO|'
+            r'CANCELAMENTO|DESCREDENCIAMENTO)',
+            window, re.IGNORECASE)
+        fields["📋 Tipo"]     = tipo.group(1).upper() if tipo else None
+        fields["💰 Valor"]    = first(_RE_MONEY, window)
+        fields["🏢 Empresa"]  = get_company(window)
+        fields["📄 CNPJ"]     = first(_RE_CNPJ, window)
+        motivo = None
+        for pat in [
+            r'em virtude d[oa]\s+(.{15,150}?)(?:\.|,\s+essa empresa)',
+            r'decorre\s+do?\s+descumprimento\s+(.{10,120}?)(?:\.|$)',
+            r'por\s+(?:descumprimento|atraso|não\s+(?:substituição|entrega|atendimento)|'
+            r'deixar\s+de)\s+(.{10,120}?)(?:\.|$)',
+            r'em\s+razão\s+da?\s+(?:não\s+)?(.{10,120}?)(?:\.|$)',
+        ]:
+            m2 = re.search(pat, window, re.IGNORECASE)
+            if m2:
+                c = m2.group(1).strip()
+                if not re.search(r'fundamento\s+no\s+artigo|raz[aã]o\s+de\s+decidir', c, re.IGNORECASE):
+                    motivo = c; break
+        fields["⚠️ Motivo"]   = motivo
+        cp = re.search(r'Termo\s+de\s+Contrato\s+[Nnº°.]*\s*([\w/.-]+(?:/\w+)*)',
+                       window, re.IGNORECASE)
+        fields["📄 Contrato"] = cp.group(1).strip() if cp else None
+        fields["🏛️ Órgão"]   = get_secretaria(window)
+        fields["🔖 Processo"] = first(_RE_PROCESS, window)
+
+    elif category == "legal":
+        fields["🔖 Processo"] = first(_RE_PROCESS, window)
+        subj = re.search(r'(?:assunto|objeto)[:\s]+(.{10,200}?)(?:\.|$)', window, re.IGNORECASE)
+        fields["📋 Assunto"]  = subj.group(1).strip() if subj else None
+        fields["📅 Data"]     = first(_RE_DATE, window)
+        fields["🏢 Empresa"]  = get_company(window)
+
+    elif category == "infrastructure":
+        fields["🔖 Processo"] = first(_RE_PROCESS, window)
+        fields["💰 Valor"]    = first(_RE_MONEY, window)
+        loc = re.search(
+            r'(?:rua|avenida|av\.|endere[çc]o|bairro|localizado)[:\s]+(.{5,120}?)(?:\.|,|$)',
+            window, re.IGNORECASE)
+        fields["📍 Local"] = loc.group(1).strip() if loc else None
+        obj = re.search(r'(?:objeto|assunto)[:\s]+(.{10,150}?)(?:\.|$)', window, re.IGNORECASE)
+        fields["📦 Objeto"] = obj.group(1).strip() if obj else None
+
+    elif category == "investigative":
+        fields["🔖 Processo"]  = first(_RE_PROCESS, window)
+        fields["🏢 Empresa"]   = get_company(window)
+        fields["📄 CNPJ"]      = first(_RE_CNPJ, window)
+        fields["💰 Valor"]     = first(_RE_MONEY, window)
+        subj = re.search(r'(?:assunto|objeto|apura[çc][aã]o)[:\s]+(.{10,200}?)(?:\.|$)',
+                         window, re.IGNORECASE)
+        fields["📋 Descrição"] = subj.group(1).strip() if subj else None
+        fields["📅 Data"]      = first(_RE_DATE, window)
+
+    else:
+        # Generic extraction for thematic categories
+        fields["💰 Valor"]    = first(_RE_MONEY, window)
+        fields["🏢 Empresa"]  = get_company(window)
+        fields["📄 CNPJ"]     = first(_RE_CNPJ, window)
+        fields["🔖 Processo"] = first(_RE_PROCESS, window)
+        fields["📅 Data"]     = first(_RE_DATE, window)
+        obj = re.search(r'(?:objeto|assunto)[:\s]+(.{10,150}?)(?:\.|$)', window, re.IGNORECASE)
+        fields["📦 Descrição"] = obj.group(1).strip() if obj else None
+
+    return {k: v for k, v in fields.items() if v}
+
+# ===========================================================================
+# DOCUMENT ACQUISITION
+# ===========================================================================
+def acquire_document(session: requests.Session) -> tuple:
+    """
+    Returns (content_bytes, content_type) where content_type is 'pdf' or 'text'.
+    """
+    src_type = SOURCE_CONFIG["type"]
+
+    if src_type == "signed_pdf":
+        return (_acquire_signed_pdf(session), "pdf")
+
+    elif src_type == "direct_pdf":
+        url_fn  = SOURCE_CONFIG.get("direct_pdf_url_fn")
+        url_str = SOURCE_CONFIG.get("direct_pdf_url", "")
+        url     = url_fn() if callable(url_fn) else url_str
+        print(f"  PDF URL: {url}")
+        return (_download_pdf(session, url), "pdf")
+
+    elif src_type == "rss_feed":
+        return (_acquire_rss(session), "text")
+
+    elif src_type == "inlabs_api":
+        return (_acquire_inlabs(session), "text")
+
+    else:
+        print(f"  ⚠️  Unsupported source type: {src_type}")
+        return (None, None)
+
+def _acquire_signed_pdf(session):
+    try:
+        r = session.get(SOURCE_CONFIG["edition_url"], timeout=20)
+        r.encoding = SOURCE_CONFIG.get("page_encoding", "utf-8")
+        html = r.text
+    except Exception as e:
+        print(f"  Edition page failed: {e}"); return None
+    tokens = re.findall(SOURCE_CONFIG["file_link_pattern"], html, re.IGNORECASE)
+    print(f"  Links found: {len(tokens)}")
+    if not tokens: return None
+    idx = SOURCE_CONFIG.get("file_link_index", 0)
+    url = tokens[min(idx, len(tokens)-1)]
+    if not url.startswith("http"):
+        url = SOURCE_CONFIG["base_url"] + "/" + url.lstrip("/")
+    return _download_pdf(session, url)
+
+def _download_pdf(session, url):
+    try:
+        r = session.get(url, timeout=120, stream=True)
+        if r.status_code != 200:
+            print(f"  HTTP {r.status_code}"); return None
+        data = b"".join(r.iter_content(chunk_size=65536))
+        if data[:4] != b"%PDF":
+            print(f"  Not a PDF: {data[:20]}"); return None
+        print(f"  ✅ {len(data):,} bytes")
+        return data
+    except Exception as e:
+        print(f"  Download error: {e}"); return None
+
+def _acquire_rss(session):
+    """Fetch RSS feed and return concatenated article text."""
+    import xml.etree.ElementTree as ET
+    url = SOURCE_CONFIG.get("rss_url", "")
+    try:
+        r = session.get(url, timeout=30)
+        root = ET.fromstring(r.content)
+        items = []
+        for item in root.iter("item"):
+            title = item.findtext("title", "")
+            desc  = item.findtext("description", "")
+            items.append(f"\n\x0c\n{title}\n{desc}")
+        text = "\n".join(items)
+        print(f"  RSS: {len(items)} items, {len(text):,} chars")
+        return text.encode("utf-8")
+    except Exception as e:
+        print(f"  RSS error: {e}"); return None
+
+def _acquire_inlabs(session):
+    """
+    Search the DOU via INLABS API for each keyword.
+    Returns concatenated article text.
+    """
+    base     = SOURCE_CONFIG["api_base"]
+    email    = SOURCE_CONFIG.get("api_email", "")
+    password = SOURCE_CONFIG.get("api_password", "")
+    sections = SOURCE_CONFIG.get("sections", ["3"])
+    today    = datetime.date.today().strftime("%d/%m/%Y")
+
+    if not email or not password:
+        print("  ⚠️  DOU_EMAIL / DOU_PASSWORD not set"); return None
+
+    # Authenticate
+    print("  Authenticating with INLABS…")
+    try:
+        auth_r = session.post(
+            f"{base}/api/autenticar",
+            json={"email": email, "password": password},
+            timeout=15)
+        if auth_r.status_code != 200:
+            print(f"  Auth failed: {auth_r.status_code}"); return None
+        token = auth_r.json().get("token", "")
+        session.headers.update({"Authorization": f"Bearer {token}"})
+        print("  ✅ Auth OK")
+    except Exception as e:
+        print(f"  Auth error: {e}"); return None
+
+    # Search for each keyword
+    articles = []
+    seen_ids = set()
+    for kw in KEYWORDS:
+        for section in sections:
+            try:
+                r = session.get(
+                    f"{base}/api/search",
+                    params={"q": kw, "s": section, "from": today, "to": today},
+                    timeout=20)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                for item in data.get("items", []):
+                    aid = item.get("id", "")
+                    if aid in seen_ids: continue
+                    seen_ids.add(aid)
+                    # Fetch full content
+                    content_r = session.get(
+                        f"{base}/api/conteudo",
+                        params={"id": aid}, timeout=15)
+                    if content_r.status_code == 200:
+                        body = content_r.json().get("body", "")
+                        # Strip HTML tags
+                        body = re.sub(r'<[^>]+>', ' ', body)
+                        articles.append(f"\x0c\n{item.get('title','')}\n{body}")
+            except Exception as e:
+                print(f"  INLABS error for '{kw}': {e}")
+            time.sleep(0.3)
+
+    text = "\n".join(articles)
+    print(f"  INLABS: {len(articles)} articles, {len(text):,} chars")
+    return text.encode("utf-8") if text else None
+
+# ===========================================================================
+# TEXT EXTRACTION
+# ===========================================================================
+def extract_text(raw_bytes: bytes, content_type: str) -> str:
+    if content_type == "text":
+        return raw_bytes.decode("utf-8", errors="replace")
+    # PDF
+    n_col = SOURCE_CONFIG.get("columns", 2)
+    return _extract_pdf(raw_bytes, n_col)
+
+def _extract_pdf(pdf_bytes, n_columns=2):
+    from pdfminer.high_level import extract_pages
+    from pdfminer.layout import LTTextBox, LAParams
+    from pdfminer.high_level import extract_text as pm_extract
+    laparams = LAParams(line_margin=0.4, char_margin=2.0, word_margin=0.1,
+                        boxes_flow=None)
+    parts = []
+    try:
+        for page in extract_pages(io.BytesIO(pdf_bytes), laparams=laparams):
+            if n_columns == 1:
+                boxes = sorted(
+                    [(el.bbox[3], el.get_text()) for el in page
+                     if isinstance(el, LTTextBox) and el.get_text().strip()],
+                    reverse=True)
+                parts.append("\n".join(t for _, t in boxes))
+            else:
+                mid = page.width * 0.52
+                left  = sorted([(el.bbox[3], el.get_text()) for el in page
+                                if isinstance(el, LTTextBox) and el.get_text().strip()
+                                and (el.bbox[0]+el.bbox[2])/2 < mid], reverse=True)
+                right = sorted([(el.bbox[3], el.get_text()) for el in page
+                                if isinstance(el, LTTextBox) and el.get_text().strip()
+                                and (el.bbox[0]+el.bbox[2])/2 >= mid], reverse=True)
+                parts.append("\n".join(t for _, t in left + right))
+            parts.append("\x0c")
+        result = "\n".join(parts)
+        print(f"  Extracted: {len(result):,} chars")
+        return result
+    except Exception as e:
+        print(f"  PDF extraction failed ({e}), falling back")
+        try:
+            return pm_extract(io.BytesIO(pdf_bytes))
+        except Exception:
+            return ""
+
+# ===========================================================================
+# ARTICLE BOUNDARIES
+# ===========================================================================
+def build_boundary_index(text: str) -> list:
+    boundaries = set()
+    for pattern in SOURCE_CONFIG.get("article_boundaries", []):
+        for m in re.finditer(pattern, text):
+            boundaries.add(m.start())
+    return sorted(boundaries)
+
+def get_bounded_window(text, pos, kw_len, boundaries, max_radius=WINDOW_SIDE):
+    lc = [b for b in boundaries if b < pos]
+    rc = [b for b in boundaries if b > pos + kw_len]
+    left  = max(lc,  default=pos - max_radius)
+    right = min(rc,  default=pos + kw_len + max_radius)
+    left  = max(left,  pos - max_radius)
+    right = min(right, pos + kw_len + max_radius)
+    return re.sub(r'\s+', ' ', text[left:right]).strip()
+
+# ===========================================================================
+# FILTER
+# ===========================================================================
+def hit_passes_filter(kw: str, window: str) -> tuple:
+    rules        = KEYWORD_FILTERS.get(kw, {})
+    wl           = window.lower()
+
+    min_win = rules.get("min_window")
+    if min_win and len(window) < min_win:
+        return False, "window too short"
+
+    require_any = rules.get("require_any", [])
+    if require_any and not any(p.lower() in wl for p in require_any):
+        return False, "require_any: none found"
+
+    for phrase in rules.get("skip_if", []):
+        if phrase.lower() in wl:
+            return False, f"skip_if: '{phrase}'"
+
+    min_val = rules.get("min_value")
+    if min_val:
+        vs = first(_RE_MONEY, window)
+        if vs:
+            amt = parse_brl(vs)
+            if 0 < amt < min_val:
+                return False, f"value R${amt:,.0f} < min R${min_val:,.0f}"
+
+    return True, ""
+
+# ===========================================================================
+# SCAN
+# ===========================================================================
+def scan_text(full_text: str) -> list:
+    full_norm  = normalize(full_text)
+    boundaries = build_boundary_index(full_text)
+    print(f"  Boundaries: {len(boundaries)}")
+
+    pb = [(m.start(), f"p.{i+1}")
+          for i, m in enumerate(re.finditer(r"\x0c", full_text))]
+
+    def page(pos):
+        p = "p.1"
+        for pp, pl in pb:
+            if pp <= pos: p = pl
+            else: break
+        return p
+
+    matches = []
+    for kw in KEYWORDS:
+        kw_norm      = normalize(kw)
+        category     = KEYWORD_CATEGORIES.get(kw, "general")
+        rules        = KEYWORD_FILTERS.get(kw, {})
+        max_hits     = rules.get("max_hits", 999)
+        max_per_cnpj = rules.get("max_hits_per_cnpj", 999)
+        sp           = 0
+        hits         = 0
+        skipped      = 0
+        cnpj_count: dict = {}
+
+        while True:
+            pos = full_norm.find(kw_norm, sp)
+            if pos == -1: break
+
+            window = get_bounded_window(full_text, pos, len(kw), boundaries)
+            ok, reason = hit_passes_filter(kw, window)
+            if not ok:
+                skipped += 1
+                sp = pos + max(len(kw_norm), 600)
+                continue
+
+            if max_per_cnpj < 999:
+                cnpj_raw = first(_RE_CNPJ, window)
+                if cnpj_raw:
+                    ck = re.sub(r'[\s.]', '', cnpj_raw)
+                    if cnpj_count.get(ck, 0) >= max_per_cnpj:
+                        skipped += 1
+                        sp = pos + max(len(kw_norm), 600)
+                        continue
+                    cnpj_count[ck] = cnpj_count.get(ck, 0) + 1
+
+            fields = extract_fields(window, category, kw)
+            theme  = infer_theme(window, fields, category)
+
+            matches.append({
+                "keyword":  kw,
+                "category": category,
+                "page":     page(pos),
+                "fields":   fields,
+                "window":   window,
+                "theme":    theme,
+            })
+            hits += 1
+            sp = pos + max(len(kw_norm), 600)
+            if hits >= max_hits: break
+
+        if hits:
+            msg = f"  ✅ '{kw}': {hits} aceita(s)"
+            if skipped: msg += f", {skipped} filtrada(s)"
+            print(msg)
+        elif skipped:
+            print(f"  ✗  '{kw}' ({skipped} filtrada(s))")
+
+    return matches
+
+# ===========================================================================
+# TELEGRAM REPORT
+# ===========================================================================
+def build_keyword_messages(kw: str, hits: list, date_str: str) -> list:
+    cat    = hits[0]["category"]
+    icon   = CATEGORY_ICONS.get(cat, "🔍")
+    src    = SOURCE_CONFIG["short_name"]
+    header = (
+        f"🚨 *{src} — {date_str}*\n"
+        f"{icon} 🔍 *Busca: {kw.upper()}* — {len(hits)} ocorrência(s)"
+    )
+    footer = f"🔗 [Abrir edição]({SOURCE_CONFIG['portal_url']})"
+    blocks = []
+    for i, h in enumerate(hits, 1):
+        lines = [f"\n{'━'*20}",
+                 f"*[{i}/{len(hits)}]* 📍 {h['page']}"]
+        # Theme badge — every hit shows its journalistic theme
+        if h.get("theme"):
+            t = h["theme"]
+            lines.append(f"  🏷️ *{t['emoji']} {t['label']}*")
+        if h["fields"]:
+            for label, value in h["fields"].items():
+                lines.append(f"  {label}: {value}")
+        else:
+            lines.append("  _Nenhum campo estruturado extraído_")
+        lines.append(f"\n  📄 *Contexto:*")
+        raw = re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', h["window"])
+        lines.append(f"  {raw}")
+        blocks.append("\n".join(lines))
+    return split_into_parts(header, blocks, footer, kw=kw, total_hits=len(hits))
+
+def build_summary_message(matches: list, date_str: str) -> str:
+    by_kw = {}
+    for m in matches:
+        by_kw.setdefault(m["keyword"], []).append(m)
+
+    # Group by journalistic theme for the summary header
+    by_theme: dict = {}
+    for m in matches:
+        if m.get("theme"):
+            tid = m["theme"]["id"]
+            by_theme.setdefault(tid, {"info": m["theme"], "count": 0})
+            by_theme[tid]["count"] += 1
+
+    src   = SOURCE_CONFIG["short_name"]
+    emoji = SOURCE_CONFIG["emoji"]
+    lines = [
+        f"{emoji} *{src} — {date_str}*",
+        f"📋 *{len(by_kw)} termos* — {len(matches)} ocorrências\n",
+    ]
+    if by_theme:
+        lines.append("*Por tema jornalístico:*")
+        for tid, td in sorted(by_theme.items(), key=lambda x: -x[1]["count"]):
+            t = td["info"]
+            lines.append(f"  {t['emoji']} {t['label']}: {td['count']} ocorrência(s)")
+        lines.append("")
+
+    lines.append("*Por termo:*")
+    for kw, hits in by_kw.items():
+        icon = CATEGORY_ICONS.get(hits[0]["category"], "🔍")
+        lines.append(f"  {icon} 🔍 *{kw}*: {len(hits)}")
+
+    lines += [
+        f"\n🔗 [Abrir edição]({SOURCE_CONFIG['portal_url']})",
+        "_PDF completo na próxima mensagem._",
+    ]
+    return "\n".join(lines)
+
+# ===========================================================================
+# MAIN
+# ===========================================================================
+def main():
+    today    = datetime.date.today()
+    date_str = today.strftime("%d/%m/%Y")
+    src      = SOURCE_CONFIG["short_name"]
+    print(f"=== {src} Monitor — {date_str} ===\n")
+
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID,
+                  "text": f"🤖 {src} iniciado — {date_str}",
+                  "disable_notification": True},
+            timeout=10)
+    except Exception:
+        pass
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "pt-BR,pt;q=0.9",
+    })
+    if SOURCE_CONFIG.get("session_url"):
+        try: session.get(SOURCE_CONFIG["session_url"], timeout=15)
+        except Exception: pass
+
+    print(f"\n⬇️  Acquiring document ({SOURCE_CONFIG['type']})…")
+    raw_bytes, content_type = acquire_document(session)
+    if not raw_bytes:
+        send_telegram(f"⚠️ *{src} — {date_str}*\nNão foi possível obter o documento.")
+        sys.exit(1)
+
+    print("\n📖 Extracting text…")
+    full_text = extract_text(raw_bytes, content_type)
+    if not full_text or len(full_text) < 500:
+        send_telegram(f"⚠️ *{src} — {date_str}*\nExtração de texto falhou.")
+        sys.exit(1)
+
+    print("\n🔎 Scanning…")
+    matches = scan_text(full_text)
+    print(f"\n  Total accepted: {len(matches)}")
+
+    if not matches:
+        send_telegram(f"✅ *{src} — {date_str}*\nNenhum termo encontrado.")
+        return
+
+    # 1. Summary
+    print("\n📨 Summary…")
+    send_telegram(build_summary_message(matches, date_str))
+    time.sleep(0.5)
+
+    # 2. PDF attachment (only for PDF sources)
+    if content_type == "pdf":
+        print("📎 PDF…")
+        send_pdf(raw_bytes,
+                 f"📰 *{src} — {date_str}* · {len(raw_bytes)/1e6:.1f} MB")
+        time.sleep(1)
+
+    # 3. Keyword detail messages
+    by_kw = {}
+    for m in matches: by_kw.setdefault(m["keyword"], []).append(m)
+    for kw, hits in by_kw.items():
+        print(f"\n📨 '{kw}' ({len(hits)})…")
+        parts = build_keyword_messages(kw, hits, date_str)
+        print(f"   → {len(parts)} msg(s)")
+        send_message_parts(parts)
+        time.sleep(0.5)
+
+if __name__ == "__main__":
+    main()
