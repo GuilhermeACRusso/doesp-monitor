@@ -3,35 +3,15 @@ DOESP Monitor v4.0 — Diário Oficial do Estado de São Paulo
 ===========================================================
 Portal: https://doe.sp.gov.br/sumario
 
-ARQUITETURA v4.0 — Search-first, sem download de PDF
-  ANTES (v3.x): descobre UUID → baixa PDF (190-274pp) → extrai texto → scan
-    • Falha total se UUID não encontrado
-    • Pesado: 150+ MB de PDF por execução
-    • Nenhum resultado se API de UUID bloqueia
+ARQUITETURA v4.0 — Search API primeiro, sem download de PDF enorme
+  API confirmada (19/05/2026):
+    do-api-web-search.doe.sp.gov.br/v2/publications/attachment/downloadattachment/{id}
+    → retorna PDF de publicação individual
+  Portanto endpoint de busca deve ser:
+    do-api-web-search.doe.sp.gov.br/v2/publications?text=...&journalName=...&date=...
 
-  AGORA (v4.0): Search API → referências, sem PDF
-    1. _discover_search_endpoint()
-         Testa ~20 paths no do-api-web-search.doe.sp.gov.br
-         Salva o endpoint que retorna JSON válido
-         Se falhar → fallback para descoberta de UUID + PDF mínimo
-    2. search_caderno(caderno, keyword)
-         Chama o search endpoint com: text, journalName, rootSectionName, date
-         Retorna lista de referências: {title, page, excerpt, edition_id}
-    3. score_reference() — TV scoring adaptado para referências
-    4. build_ref_card() — cartão com link direto ao portal
-         Substitui ficha/digesto: referência clicável, não extrato de PDF
-
-  OUTPUT (referência, não ficha):
-    📋 DOESP 19/05/2026 | Executivo > Atos Normativos | p.45
-    🔑 "extrato de contrato"
-    📄 PORTARIA GP 123/2026
-    🔗 [Abrir no portal](https://doe.sp.gov.br/sumario?...)
-
-  DOMÍNIOS CONFIRMADOS (do log de 19/05/2026):
-    do-api-web-search.doe.sp.gov.br         ← SEARCH (novo primário)
-    do-api-publication-pdf.doe.sp.gov.br    ← PDF download (fallback)
-    do-api-publication-workflow.doe.sp.gov.br
-    do-api-admin-edition.doe.sp.gov.br      ← retorna HTML (descartado)
+  Se search API retornar JSON → scan_via_search() → referências sem PDF
+  Se search API falhar → get_uuid_fallback() → baixa só primeiras 15pp do PDF
 
 Secrets: TELEGRAM_TOKEN, CHAT_ID
 """
@@ -43,9 +23,6 @@ CHAT_ID        = os.getenv("CHAT_ID")
 if not TELEGRAM_TOKEN or not CHAT_ID:
     print("FATAL: TELEGRAM_TOKEN ou CHAT_ID ausentes."); sys.exit(1)
 
-# ===========================================================================
-# CADERNOS
-# ===========================================================================
 CADERNOS = [
     {"journalName":"Executivo",  "rootSectionName":"Atos Normativos",
      "label":"Normativos", "emoji":"📋"},
@@ -57,18 +34,15 @@ CADERNOS = [
      "label":"Municípios", "emoji":"🏛️"},
 ]
 
-# ===========================================================================
-# CONFIG
-# ===========================================================================
 SOURCE_NAME  = "DOESP"
 SOURCE_EMOJI = "📋"
 PORTAL_URL   = "https://doe.sp.gov.br/sumario"
 PORTAL_BASE  = "https://doe.sp.gov.br"
-PDF_API      = "https://do-api-publication-pdf.doe.sp.gov.br"
 SEARCH_API   = "https://do-api-web-search.doe.sp.gov.br"
+PDF_API      = "https://do-api-publication-pdf.doe.sp.gov.br"
 WORKFLOW_API = "https://do-api-publication-workflow.doe.sp.gov.br"
-
-UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I)
+UUID_RE      = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I)
+MAX_PDF_PAGES = 15
 
 # ===========================================================================
 # KEYWORDS
@@ -144,7 +118,7 @@ CATEGORY_TV = {
 }
 
 # ===========================================================================
-# NORMALIZE / HELPERS
+# HELPERS
 # ===========================================================================
 def normalize(t):
     return "".join(c for c in unicodedata.normalize("NFKD", t)
@@ -159,169 +133,213 @@ def parse_brl(s):
     except: return 0.0
 
 def caderno_url(jn, rsn):
-    jne = requests.utils.quote(jn)
-    rsne = requests.utils.quote(rsn)
-    return f"{PORTAL_URL}?journalName={jne}&rootSectionName={rsne}"
+    return f"{PORTAL_URL}?journalName={requests.utils.quote(jn)}&rootSectionName={requests.utils.quote(rsn)}"
 
 # ===========================================================================
 # SEARCH API DISCOVERY
-# Cache the working endpoint in a module-level variable.
+# Confirmed path: /v2/publications/attachment/downloadattachment/{uuid}
+# → search endpoint is at /v2/publications?text=...
 # ===========================================================================
-_search_endpoint_cache = {}   # domain -> working path template (or None)
+_search_endpoint_cache = {}
 
-def _probe_search(session, base, path):
-    try:
-        r = session.get(base + path, timeout=10)
-        ct = r.headers.get("content-type", "")
-        if r.status_code == 200 and "json" in ct:
-            try: return r.json()
-            except: pass
-        if r.status_code == 200 and not ct.startswith("text/html"):
-            print(f"  probe {r.status_code} {ct[:30]} {base}{path[:50]}")
-    except: pass
-    return None
+def _inspect_response(data, keyword=""):
+    """Print response structure for diagnostics."""
+    if isinstance(data, list):
+        print(f"    → lista {len(data)} itens")
+        if data and isinstance(data[0], dict):
+            print(f"    → keys[0]: {list(data[0].keys())[:10]}")
+    elif isinstance(data, dict):
+        print(f"    → dict keys: {list(data.keys())[:10]}")
+        for k in ("total","totalElements","count","results","items","content","data","publications"):
+            if k in data:
+                v = data[k]
+                n = len(v) if hasattr(v,"__len__") else v
+                print(f"    → .{k}: {type(v).__name__} {n}")
 
 def discover_search_endpoint(session):
     """
-    Find which path on do-api-web-search.doe.sp.gov.br returns valid search results.
-    Returns a callable search(keyword, jn, rsn, date) -> list[dict].
+    Probe /v2/publications on do-api-web-search.doe.sp.gov.br with every
+    plausible parameter combination. Returns a search callable or None.
     """
     global _search_endpoint_cache
     if "search_fn" in _search_endpoint_cache:
         return _search_endpoint_cache["search_fn"]
 
-    hoje = datetime.date.today().isoformat()
-    probe_kw = "contrato"
-    pkw = requests.utils.quote(probe_kw)
-    # Probe paths roughly ordered by likelihood
-    probe_paths = [
-        f"/v1/search?text={pkw}&date={hoje}",
-        f"/v1/search?q={pkw}&date={hoje}",
-        f"/v1/search?texto={pkw}&date={hoje}",
-        f"/api/search?q={pkw}&date={hoje}",
-        f"/api/v1/search?q={pkw}&date={hoje}",
-        f"/v1/search?text={pkw}",
-        f"/v1/search?q={pkw}",
-        f"/v1/publications?text={pkw}&publicationDate={hoje}",
-        f"/v1/publications?q={pkw}&date={hoje}",
-        f"/v1/contents?q={pkw}&date={hoje}",
-        f"/v1/articles?q={pkw}&date={hoje}",
-        f"/search?q={pkw}&date={hoje}",
-        f"/v1/texts?q={pkw}&date={hoje}",
+    hoje    = datetime.date.today().isoformat()
+    hoje_br = datetime.date.today().strftime("%d/%m/%Y")
+    kw_enc  = requests.utils.quote("extrato de contrato")
+    jn_enc  = requests.utils.quote("Executivo")
+    rsn_enc = requests.utils.quote("Atos Normativos")
+
+    # Try Swagger docs first — great for diagnosis
+    print(f"\n  Verificando Swagger em {SEARCH_API}...")
+    for sw_path in ["/swagger/index.html", "/swagger-ui/index.html",
+                    "/v2/api-docs", "/v3/api-docs", "/openapi.json"]:
+        try:
+            r = session.get(SEARCH_API + sw_path, timeout=8)
+            ct = r.headers.get("content-type","")
+            if r.status_code == 200:
+                print(f"  ✅ Swagger {sw_path}: {ct[:40]}")
+                if "json" in ct: print(f"  Swagger: {r.text[:500]}")
+            else:
+                print(f"  {r.status_code} {sw_path}")
+        except Exception as e:
+            print(f"  err {sw_path}: {e}")
+
+    # /v2/publications — correct path based on confirmed URL
+    # Try every likely search param name and date format
+    probes = [
+        # text param + publicationDate (most likely for a Spring Boot API)
+        f"/v2/publications?text={kw_enc}&journalName={jn_enc}&rootSectionName={rsn_enc}&publicationDate={hoje}",
+        f"/v2/publications?text={kw_enc}&journalName={jn_enc}&publicationDate={hoje}",
+        f"/v2/publications?text={kw_enc}&publicationDate={hoje}",
+        # date param (alternative field name)
+        f"/v2/publications?text={kw_enc}&journalName={jn_enc}&date={hoje}",
+        f"/v2/publications?text={kw_enc}&date={hoje}",
+        # text alone (no date filter)
+        f"/v2/publications?text={kw_enc}",
+        # q param variants
+        f"/v2/publications?q={kw_enc}&journalName={jn_enc}&publicationDate={hoje}",
+        f"/v2/publications?q={kw_enc}&publicationDate={hoje}",
+        f"/v2/publications?q={kw_enc}",
+        # Other param name conventions
+        f"/v2/publications?searchText={kw_enc}&publicationDate={hoje}",
+        f"/v2/publications?conteudo={kw_enc}&publicationDate={hoje}",
+        f"/v2/publications?busca={kw_enc}&publicationDate={hoje}",
+        f"/v2/publications?termo={kw_enc}&publicationDate={hoje}",
+        # Sub-path: /v2/publications/search
+        f"/v2/publications/search?text={kw_enc}&publicationDate={hoje}",
+        f"/v2/publications/search?q={kw_enc}&date={hoje}",
+        # BR date format
+        f"/v2/publications?text={kw_enc}&publicationDate={requests.utils.quote(hoje_br)}",
+        # Root listing (no filter — might return today by default)
+        f"/v2/publications",
+        # v1 fallback
+        f"/v1/publications?text={kw_enc}&publicationDate={hoje}",
+        f"/v1/publications?q={kw_enc}&date={hoje}",
+        # /v2/search as alternative resource
+        f"/v2/search?text={kw_enc}&journalName={jn_enc}&publicationDate={hoje}",
+        f"/v2/search?q={kw_enc}&publicationDate={hoje}",
     ]
 
-    print(f"\n  Descobrindo search endpoint em {SEARCH_API}...")
-    for path in probe_paths:
-        data = _probe_search(session, SEARCH_API, path)
-        if data is not None:
-            print(f"  ✅ Search endpoint encontrado: {SEARCH_API}{path[:60]}")
-            _inspect_search_response(data, probe_kw)
-            # Build a factory for this path
-            _path_template = re.sub(r'(text|q|texto)=' + pkw, r'\1={KW}', path)
-            _path_template = re.sub(r'date=' + hoje, 'date={DATE}', _path_template)
-            _search_endpoint_cache["path"] = path
-            _search_endpoint_cache["path_template"] = _path_template
-            _search_endpoint_cache["base"] = SEARCH_API
-            _search_endpoint_cache["sample"] = data
-            fn = _make_search_fn(SEARCH_API, _path_template)
-            _search_endpoint_cache["search_fn"] = fn
-            return fn
+    print(f"\n  Testando {len(probes)} paths em {SEARCH_API}...")
+    for path in probes:
+        try:
+            r = session.get(SEARCH_API + path, timeout=12)
+            ct = r.headers.get("content-type","")
+            is_json = "json" in ct.lower()
+            print(f"  {r.status_code} {('json' if is_json else ct[:12]):<14} {(SEARCH_API+path)[-70:]}")
+            if r.status_code == 200 and is_json:
+                try:
+                    data = r.json()
+                    _inspect_response(data, "extrato de contrato")
+                    # Build template preserving path structure
+                    tmpl = path
+                    tmpl = re.sub(r'text=[^&]+',       'text={KW}',   tmpl)
+                    tmpl = re.sub(r'q=[^&]+',           'q={KW}',      tmpl)
+                    tmpl = re.sub(r'searchText=[^&]+', 'searchText={KW}', tmpl)
+                    tmpl = re.sub(r'conteudo=[^&]+',   'conteudo={KW}', tmpl)
+                    tmpl = re.sub(r'busca=[^&]+',      'busca={KW}',  tmpl)
+                    tmpl = re.sub(r'termo=[^&]+',      'termo={KW}',  tmpl)
+                    tmpl = re.sub(re.escape(hoje_br).replace("/",r"[/]"), '{DATE_BR}', tmpl)
+                    tmpl = re.sub(re.escape(hoje),     '{DATE}',      tmpl)
+                    fn = _make_search_fn(SEARCH_API, tmpl)
+                    _search_endpoint_cache["search_fn"] = fn
+                    _search_endpoint_cache["template"]  = tmpl
+                    return fn
+                except Exception as e:
+                    print(f"  JSON err: {e}; body={r.text[:100]}")
+            elif r.status_code in (401, 403):
+                print(f"  → auth/block. Outros paths também falharão.")
+                break
+        except Exception as e:
+            print(f"  exc {path[:50]}: {e}")
 
-    # Also try workflow API
-    print(f"  Tentando workflow API {WORKFLOW_API}...")
+    # Probe WORKFLOW API too (maybe it has an editions listing)
+    print(f"\n  Testando {WORKFLOW_API}...")
     for path in [
-        f"/v1/search?q={pkw}&date={hoje}",
+        f"/v1/editions?journalName={jn_enc}&rootSectionName={rsn_enc}&date={hoje}",
+        f"/v2/editions?journalName={jn_enc}&rootSectionName={rsn_enc}&date={hoje}",
         f"/v1/editions?date={hoje}",
-        f"/v1/publications?date={hoje}",
+        f"/v2/editions?date={hoje}",
+        f"/v1/publications?text={kw_enc}&date={hoje}",
     ]:
-        data = _probe_search(session, WORKFLOW_API, path)
-        if data is not None:
-            print(f"  ✅ Workflow endpoint: {WORKFLOW_API}{path[:50]}")
-            _search_endpoint_cache["search_fn"] = None
-            return None
+        try:
+            r = session.get(WORKFLOW_API + path, timeout=10)
+            ct = r.headers.get("content-type","")
+            is_json = "json" in ct.lower()
+            print(f"  {r.status_code} {('json' if is_json else ct[:12]):<14} {path[:70]}")
+            if r.status_code == 200 and is_json:
+                data = r.json()
+                print(f"  workflow: {str(data)[:300]}")
+        except Exception as e:
+            print(f"  exc {path[:40]}: {e}")
 
-    print("  ⚠️ Nenhum search endpoint encontrado — usando fallback UUID+PDF")
+    print("  ⚠️ Nenhum search endpoint JSON encontrado — fallback UUID+PDF")
     _search_endpoint_cache["search_fn"] = None
     return None
 
-def _inspect_search_response(data, keyword):
-    """Print a brief summary of the search response structure for diagnostics."""
-    if isinstance(data, list):
-        print(f"  response: lista com {len(data)} itens")
-        if data: print(f"  primeiro item: {list(data[0].keys()) if isinstance(data[0], dict) else type(data[0])}")
-    elif isinstance(data, dict):
-        print(f"  response: dict {list(data.keys())[:8]}")
-        for k in ("total", "count", "results", "items", "content", "data"):
-            if k in data:
-                v = data[k]
-                print(f"  .{k}: {type(v).__name__} len={len(v) if hasattr(v,'__len__') else '-'}")
-
 def _make_search_fn(base, path_template):
-    """Factory: returns a function search(keyword, jn, rsn, date) -> list[dict]."""
-    def _search(session, keyword, jn, rsn, date):
-        kw_enc = requests.utils.quote(keyword)
-        jn_enc = requests.utils.quote(jn)
-        rsn_enc = requests.utils.quote(rsn)
-        path = path_template.replace("{KW}", kw_enc).replace("{DATE}", date)
-        # Add journalName / rootSectionName if supported
+    def _search(session, keyword, jn, rsn, date, date_br):
+        path = path_template
+        path = path.replace("{KW}",      requests.utils.quote(keyword))
+        path = path.replace("{DATE}",    date)
+        path = path.replace("{DATE_BR}", requests.utils.quote(date_br))
+        # If journalName/rootSectionName not in template, add them
+        if "{JN}" in path:
+            path = path.replace("{JN}",  requests.utils.quote(jn))
+        if "{RSN}" in path:
+            path = path.replace("{RSN}", requests.utils.quote(rsn))
         if "journalName" not in path:
-            path += f"&journalName={jn_enc}&rootSectionName={rsn_enc}"
+            path += f"&journalName={requests.utils.quote(jn)}&rootSectionName={requests.utils.quote(rsn)}"
         try:
             r = session.get(base + path, timeout=15)
             if r.status_code == 200:
-                data = r.json()
-                return _extract_hits(data, keyword, jn, rsn)
+                ct = r.headers.get("content-type","")
+                if "json" in ct:
+                    return _extract_hits(r.json(), keyword, jn, rsn)
         except Exception as e:
             print(f"  search err: {e}")
         return []
     return _search
 
+def _find_field(item, candidates, default=""):
+    for c in candidates:
+        v = item.get(c)
+        if v is not None and str(v).strip():
+            return str(v).strip() if not isinstance(v,(dict,list)) else default
+    return default
+
 def _extract_hits(data, keyword, jn, rsn):
-    """
-    Normalize search API response to list of reference dicts.
-    Handles multiple possible response schemas.
-    """
     items = []
     if isinstance(data, list): items = data
     elif isinstance(data, dict):
-        for k in ("results","items","content","data","hits","publications","texts","articles"):
-            if k in data and isinstance(data[k], list):
-                items = data[k]; break
-        if not items and "total" in data:
-            items = [data]
+        for k in ("results","items","content","data","hits","publications","texts","articles","list"):
+            if k in data and isinstance(data[k], list): items = data[k]; break
+        if not items: items = [data] if data else []
 
-    refs = []
     kw_low = normalize(keyword)
+    refs = []
     for item in items:
         if not isinstance(item, dict): continue
-        # Look for keyword in any text field
         text_blob = " ".join(str(v) for v in item.values() if isinstance(v, str))
         if kw_low not in normalize(text_blob): continue
-        # Extract standard reference fields
-        ref = {
-            "keyword": keyword,
-            "journal": _find_field(item, ["journalName","journal","caderno","diario"], jn),
-            "section": _find_field(item, ["rootSectionName","sectionName","section","secao"], rsn),
-            "title":   _find_field(item, ["title","titulo","name","docTitle","documentTitle","heading"], ""),
-            "page":    _find_field(item, ["page","pagina","pageNumber","pg"], ""),
-            "excerpt": _find_field(item, ["excerpt","trecho","content","text","body","snippet","description"], "")[:300],
-            "edition_id": _find_field(item, ["editionId","edition_id","uuid","id"], ""),
-            "doc_type": _find_field(item, ["type","tipo","docType","documentType"], ""),
-            "date":    _find_field(item, ["date","data","publicationDate","publishedAt"], ""),
-            "raw": item,
-        }
-        refs.append(ref)
+        refs.append({
+            "keyword":    keyword,
+            "journal":    _find_field(item, ["journalName","journal","caderno","diario"], jn),
+            "section":    _find_field(item, ["rootSectionName","sectionName","section","secao"], rsn),
+            "title":      _find_field(item, ["title","titulo","name","docTitle","heading","nomeAto"], ""),
+            "page":       _find_field(item, ["page","pagina","pageNumber","numeroPagina","pg"], ""),
+            "excerpt":    _find_field(item, ["content","text","body","snippet","excerpt","trecho","conteudo","texto"], "")[:400],
+            "edition_id": _find_field(item, ["editionId","edition_id","edicaoId","uuid","id"], ""),
+            "attach_id":  _find_field(item, ["attachmentId","attachment_id","arquivoId","fileId"], ""),
+            "doc_type":   _find_field(item, ["type","tipo","docType","tipoAto"], ""),
+            "date":       _find_field(item, ["date","data","publicationDate","dataPublicacao"], ""),
+        })
     return refs
 
-def _find_field(item, candidates, default=""):
-    for c in candidates:
-        if c in item and item[c] is not None:
-            v = item[c]
-            return str(v).strip() if not isinstance(v, (dict,list)) else default
-    return default
-
 # ===========================================================================
-# SCORING — lightweight for references (no extracted fields)
+# SCORING
 # ===========================================================================
 def score_ref(ref, excerpt_low):
     keyword = ref["keyword"]
@@ -330,7 +348,7 @@ def score_ref(ref, excerpt_low):
     score   = {1:4, 2:2, 3:0}.get(tier, 0)
     fatores = []
 
-    money = re.search(r"R\$\s*([\d.,]+)", excerpt_low, re.I)
+    money = re.search(r"r\$\s*([\d.,]+)", excerpt_low)
     if money:
         amt = parse_brl(money.group(1))
         if   amt >= 10_000_000: score += 4; fatores.append(f"R${amt/1e6:.0f}M")
@@ -347,32 +365,26 @@ def score_ref(ref, excerpt_low):
         score += 1; fatores.append("PENITENCIÁRIO")
     if any(t in excerpt_low for t in ["demissão","suspensão por","aposentadoria compulsória"]):
         score += 2; fatores.append("SANÇÃO FUNCIONAL")
-
     if ref.get("title"):  score += 1; fatores.append("TÍTULO")
     if ref.get("page"):   score += 1; fatores.append(f"p.{ref['page']}")
 
-    if   score >= 8: verdade = "🟢 APROVADA"
-    elif score >= 5: verdade = "🟡 PODE RENDER"
-    else:            verdade = "🔴 BACKGROUND"
-    return verdade, score, fatores
+    if   score >= 8: v = "🟢 APROVADA"
+    elif score >= 5: v = "🟡 PODE RENDER"
+    else:            v = "🔴 BACKGROUND"
+    return v, score, fatores
 
 # ===========================================================================
-# REFERENCE CARD BUILDER
-# No more fichas. Just a clean reference with a clickable link.
+# REFERENCE CARD
 # ===========================================================================
 def build_ref_card(ref, date_str, veredito, score, fatores):
     cat   = KEYWORD_CATEGORIES.get(ref["keyword"], "general")
-    _, icon, cat_nome = CATEGORY_TV.get(cat, (3, "🔍", "Geral"))
-    jn    = ref.get("journal", "")
-    rsn   = ref.get("section", "")
-    lbl   = next((c["label"] for c in CADERNOS if c["journalName"]==jn and c["rootSectionName"]==rsn), rsn)
+    _, icon, cat_nome = CATEGORY_TV.get(cat, (3,"🔍","Geral"))
+    jn    = ref.get("journal","")
+    rsn   = ref.get("section","")
+    lbl   = next((c["label"] for c in CADERNOS if c["journalName"]==jn and c["rootSectionName"]==rsn), rsn or jn)
     emo   = next((c["emoji"] for c in CADERNOS if c["journalName"]==jn and c["rootSectionName"]==rsn), "📋")
     fator_str = " · ".join(fatores) if fatores else "—"
     link  = caderno_url(jn or "Executivo", rsn or "Atos Normativos")
-    page  = ref.get("page", "")
-    title = ref.get("title", "")
-    exc   = ref.get("excerpt", "")
-    dtype = ref.get("doc_type", "")
 
     lines = [
         f"{SOURCE_EMOJI} *DOESP {date_str}* | {emo} {lbl}",
@@ -380,19 +392,23 @@ def build_ref_card(ref, date_str, veredito, score, fatores):
         f"🔑 `{ref['keyword']}` | Score {score} | {fator_str}",
         "─" * 22,
     ]
-    if dtype:   lines.append(f"📑 {dtype[:80]}")
-    if title:   lines.append(f"📄 *{title[:100]}*")
-    if page:    lines.append(f"📖 Página {page}")
-    if exc:
-        # Highlight keyword in excerpt
-        hi = re.sub(f"(?i)({re.escape(ref['keyword'])})", r"*\1*", exc[:250])
+    if ref.get("doc_type"): lines.append(f"📑 {ref['doc_type'][:80]}")
+    if ref.get("title"):    lines.append(f"📄 *{ref['title'][:120]}*")
+    if ref.get("page"):     lines.append(f"📖 Página {ref['page']}")
+    if ref.get("date"):     lines.append(f"📅 {ref['date'][:20]}")
+    if ref.get("excerpt"):
+        hi = re.sub(f"(?i)({re.escape(ref['keyword'])})", r"*\1*", ref["excerpt"][:280])
         lines.append(f"💬 _{hi}_")
+    # Attachment download link if available
+    if ref.get("attach_id"):
+        dl_url = f"{SEARCH_API}/v2/publications/attachment/downloadattachment/{ref['attach_id']}"
+        lines.append(f"📥 [Baixar ato]({dl_url})")
     lines.append("─" * 22)
     lines.append(f"🔗 [Abrir no portal]({link})")
     return "\n".join(lines)
 
 def build_summary(results_by_caderno, date_str, mode):
-    all_hits = [h for hits in results_by_caderno.values() for h in hits]
+    all_hits = [h for v in results_by_caderno.values() for h in v]
     total = len(all_hits)
     ap = sum(1 for h in all_hits if h.get("veredito","").startswith("🟢"))
     pr = sum(1 for h in all_hits if h.get("veredito","").startswith("🟡"))
@@ -400,297 +416,240 @@ def build_summary(results_by_caderno, date_str, mode):
         f"{SOURCE_EMOJI} *{SOURCE_NAME} — {date_str}*",
         f"_{mode}_",
         f"📋 *{total} ocorrência(s)*\n",
-        f"🟢 *Aprovadas:* {ap}",
-        f"🟡 *Pode render:* {pr}",
-        f"🔴 *Background:* {total-ap-pr}\n",
+        f"🟢 Aprovadas: {ap}  🟡 Pode render: {pr}  🔴 Background: {total-ap-pr}\n",
     ]
     for cad in CADERNOS:
         lbl, emo = cad["label"], cad["emoji"]
         hits = results_by_caderno.get(lbl, [])
         a2 = sum(1 for h in hits if h.get("veredito","").startswith("🟢"))
         p2 = sum(1 for h in hits if h.get("veredito","").startswith("🟡"))
-        if hits:
-            lines.append(f"{emo} *{lbl}*: {len(hits)} | 🟢{a2} 🟡{p2}")
-        else:
-            lines.append(f"{emo} *{lbl}*: nenhum")
+        lines.append(f"{emo} *{lbl}*: {len(hits)} | 🟢{a2} 🟡{p2}" if hits
+                     else f"{emo} *{lbl}*: nenhum")
     lines.append("━"*20)
-    # Top hits
     for h in sorted(all_hits, key=lambda x: -x.get("score",0))[:10]:
         cat = KEYWORD_CATEGORIES.get(h["ref"]["keyword"],"general")
         _, icon, _ = CATEGORY_TV.get(cat,(3,"🔍",""))
-        pg = f" p.{h['ref']['page']}" if h["ref"].get("page") else ""
-        lbl2 = h["ref"].get("label","")
+        pg  = f" p.{h['ref']['page']}" if h["ref"].get("page") else ""
+        ttl = (h["ref"].get("title") or "")[:35]
         lines.append(f"{h.get('veredito','')[:2]} {icon} `{h['ref']['keyword'][:30]}`"
-                     f" [{lbl2}]{pg}")
+                     f" [{h['ref'].get('label','')}]{pg} {ttl}")
     lines += ["━"*20, f"\n🔗 [Portal DOESP]({PORTAL_URL})"]
     return "\n".join(lines)
 
 # ===========================================================================
-# SEARCH-BASED SCAN (primary path)
+# SEARCH-BASED SCAN
 # ===========================================================================
 def scan_via_search(session, search_fn, caderno, date_str):
-    jn   = caderno["journalName"]
-    rsn  = caderno["rootSectionName"]
-    lbl  = caderno["label"]
-    hoje = datetime.date.today().isoformat()
+    jn, rsn = caderno["journalName"], caderno["rootSectionName"]
+    lbl     = caderno["label"]
+    hoje    = datetime.date.today().isoformat()
+    hoje_br = datetime.date.today().strftime("%d/%m/%Y")
     results = []; seen = set()
+    kw_hits = {}
 
     for kw in KEYWORDS:
-        refs = search_fn(session, kw, jn, rsn, hoje)
+        refs = search_fn(session, kw, jn, rsn, hoje, hoje_br)
+        kw_hits[kw] = len(refs)
         for ref in refs:
-            ref["keyword"] = kw
-            ref["label"]   = lbl
-            ref["journal"]  = ref.get("journal") or jn
-            ref["section"]  = ref.get("section") or rsn
+            ref["keyword"] = kw; ref["label"] = lbl
+            ref["journal"] = ref.get("journal") or jn
+            ref["section"] = ref.get("section") or rsn
             dedup = (kw, ref.get("title",""), ref.get("page",""))
             if dedup in seen: continue
             seen.add(dedup)
-            exc_low = normalize(ref.get("excerpt","") + " " + ref.get("title",""))
-            veredito, score, fatores = score_ref(ref, exc_low)
-            results.append({
-                "ref": ref, "veredito": veredito, "score": score, "fatores": fatores,
-                "keyword": kw,
-            })
+            exc_low = normalize((ref.get("excerpt","") + " " + ref.get("title","")).lower())
+            v, sc, ft = score_ref(ref, exc_low)
+            results.append({"ref":ref,"veredito":v,"score":sc,"fatores":ft,"keyword":kw})
 
+    hit_kws = {k:v for k,v in kw_hits.items() if v}
+    if hit_kws: print(f"  {lbl} hits: {hit_kws}")
     ap = sum(1 for r in results if r["veredito"].startswith("🟢"))
     pr = sum(1 for r in results if r["veredito"].startswith("🟡"))
     print(f"  {lbl}: {len(results)} refs via search | 🟢{ap} 🟡{pr}")
     return results
 
 # ===========================================================================
-# UUID DISCOVERY — fallback for when search API not available
-# Simplified: only the strategies that worked in previous runs.
-# Verbose: prints HTTP status so every failure is diagnosable.
+# UUID FALLBACK
 # ===========================================================================
 def _fetch_html_once(session):
-    if hasattr(session, "_doesp_html"): return session._doesp_html, session._doesp_build_id
+    if hasattr(session,"_doesp_html"): return session._doesp_html, session._doesp_build_id
     try:
         r = session.get(PORTAL_URL, timeout=20); r.encoding="utf-8"; html=r.text
-        print(f"  HTML: HTTP {r.status_code} | {len(html):,} chars")
-        if r.status_code != 200: return None, None
-    except Exception as e: print(f"  HTML err: {e}"); return None, None
+        print(f"  HTML: {r.status_code} | {len(html):,} chars")
+        if r.status_code!=200: return None,None
+    except Exception as e: print(f"  HTML err: {e}"); return None,None
     m = re.search(r'"buildId"\s*:\s*"([^"]+)"', html)
     bid = m.group(1) if m else ""
-    if bid: print(f"  buildId: {bid}")
-    session._doesp_html = html; session._doesp_build_id = bid
+    session._doesp_html=html; session._doesp_build_id=bid
     return html, bid
 
 def _best_uuid_in(obj, jn, rsn):
-    jn_low = jn.lower().replace(" ",""); rsn_low = rsn.lower().replace(" ","")
-    def sc(t): t=str(t).lower().replace(" ",""); return (jn_low in t)*2+(rsn_low in t)*3
-    def collect(o, ctx, d):
+    jn_l=jn.lower().replace(" ",""); rsn_l=rsn.lower().replace(" ","")
+    def sc(t): t=str(t).lower().replace(" ",""); return (jn_l in t)*2+(rsn_l in t)*3
+    def col(o,ctx,d):
         if d>12: return []
         res=[]
         if isinstance(o,dict):
-            cx=" ".join(str(v) for k,v in o.items()
-                if k in ("name","journalName","rootSectionName","title","section") and isinstance(v,str))
+            cx=" ".join(str(v) for k,v in o.items() if k in
+               ("name","journalName","rootSectionName","title","section") and isinstance(v,str))
             s=ctx+sc(cx)
             for k,v in o.items():
-                if isinstance(v,str) and re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',v,re.I):
-                    res.append((s+sc(k),v))
-                else: res.extend(collect(v,s,d+1))
+                if isinstance(v,str) and re.match(r'^[0-9a-f-]{36}$',v,re.I): res.append((s+sc(k),v))
+                else: res.extend(col(v,s,d+1))
         elif isinstance(o,list):
-            for item in o: res.extend(collect(item,ctx,d+1))
+            for item in o: res.extend(col(item,ctx,d+1))
         return res
-    cands=collect(obj,0,0)
+    cands=col(obj,0,0)
     if not cands: return None
     cands.sort(reverse=True)
     return cands[0][1] if cands[0][0]>0 else (cands[0][1] if len(cands)==1 else None)
 
 def get_uuid_fallback(session, caderno):
-    """
-    Tries to find the edition UUID when the search API is unavailable.
-    Logs every HTTP status so failures are diagnosable in Actions logs.
-    """
     jn, rsn, lbl = caderno["journalName"], caderno["rootSectionName"], caderno["label"]
     hoje = datetime.date.today().isoformat()
-    jne  = requests.utils.quote(jn)
-    rsne = requests.utils.quote(rsn)
+    jne  = requests.utils.quote(jn); rsne = requests.utils.quote(rsn)
     print(f"\n  [UUID fallback] {lbl}")
 
     html, bid = _fetch_html_once(session)
 
-    # S1: __NEXT_DATA__ (works if SSR)
+    # S1: __NEXT_DATA__
     if html:
         m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
         if m:
             try:
-                data = json.loads(m.group(1))
-                u = _best_uuid_in(data, jn, rsn)
+                u = _best_uuid_in(json.loads(m.group(1)), jn, rsn)
                 if u: print(f"  UUID via __NEXT_DATA__: {u}"); return u
             except: pass
 
-    # S2: ISR JSON data route
+    # S2: ISR data route
     if bid:
-        for p in [
-            f"sumario.json?journalName={jne}&rootSectionName={rsne}",
-            f"sumario.json",
-        ]:
-            url = f"{PORTAL_BASE}/_next/data/{bid}/{p}"
+        for p in [f"sumario.json?journalName={jne}&rootSectionName={rsne}", "sumario.json"]:
             try:
-                r = session.get(url, timeout=10)
-                print(f"  S2 {r.status_code} ...{url[-55:]}")
+                r = session.get(f"{PORTAL_BASE}/_next/data/{bid}/{p}", timeout=10)
+                print(f"  S2 {r.status_code} ...{p[-50:]}")
                 if r.status_code==200:
                     u = _best_uuid_in(r.json(), jn, rsn)
                     if u: print(f"  UUID via ISR: {u}"); return u
             except: pass
 
-    # S3: JS bundle scan for API base URL + query
-    if html:
-        js_srcs = re.findall(r'/_next/static/[^"\'<>\s]+\.js', html)
-        found_bases = set()
-        for i, src in enumerate(js_srcs[:40]):
-            try:
-                r = session.get(f"{PORTAL_BASE}{src}", timeout=8)
-                if r.status_code != 200: continue
-                bases = set(re.findall(r'https?://[a-z0-9.-]+\.doe\.sp\.gov\.br', r.text))
-                ed_urls = re.findall(r'https?://[^"\'\\s]+/(?:v\d/)?editions[^"\'\\s]*', r.text)
-                for eu in ed_urls:
-                    m2 = re.match(r'(https?://[^/]+)', eu)
-                    if m2: bases.add(m2.group(1))
-                found_bases |= bases
-            except: pass
-        for base in list(found_bases):
+    # S3: PDF API v1 + v2 editions listing
+    for base in [PDF_API]:
+        for ver in ["v1","v2"]:
             for path in [
-                f"/v1/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
-                f"/v1/editions?journalName={jne}&rootSectionName={rsne}",
-                f"/api/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
+                f"/{ver}/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
+                f"/{ver}/editions?journalName={jne}&rootSectionName={rsne}",
+                f"/{ver}/editions?date={hoje}",
             ]:
                 try:
                     r = session.get(base+path, timeout=10)
                     ct = r.headers.get("content-type","")
-                    print(f"  S3 {r.status_code} {'json' if 'json' in ct else 'html'} {(base+path)[-65:]}")
-                    if r.status_code==200 and "json" in ct:
+                    is_json = "json" in ct.lower()
+                    print(f"  S3 {r.status_code} {'json' if is_json else 'html':<4} {(base+path)[-65:]}")
+                    if r.status_code==200 and is_json:
                         u = _best_uuid_in(r.json(), jn, rsn)
-                        if u: print(f"  UUID via JS scan: {u}"); return u
+                        if u: print(f"  UUID via PDF API: {u}"); return u
+                        uuids = UUID_RE.findall(json.dumps(r.json()))
+                        if uuids: print(f"  UUID candidates: {uuids[:4]}")
                 except: pass
 
-    # S4: workflow API (newly discovered from JS bundles)
-    for base in [WORKFLOW_API, PDF_API]:
+    # S4: workflow API v1 + v2
+    for ver in ["v1","v2"]:
         for path in [
-            f"/v1/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
-            f"/v1/editions?journalName={jne}&rootSectionName={rsne}",
-            f"/api/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
-            f"/v2/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
+            f"/{ver}/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
+            f"/{ver}/editions?journalName={jne}&rootSectionName={rsne}",
         ]:
             try:
-                r = session.get(base+path, timeout=10)
+                r = session.get(WORKFLOW_API+path, timeout=10)
                 ct = r.headers.get("content-type","")
-                print(f"  S4 {r.status_code} {'json' if 'json' in ct else 'html'} {(base+path)[-65:]}")
-                if r.status_code==200 and "json" in ct:
+                is_json = "json" in ct.lower()
+                print(f"  S4 {r.status_code} {'json' if is_json else 'html':<4} {(WORKFLOW_API+path)[-65:]}")
+                if r.status_code==200 and is_json:
                     u = _best_uuid_in(r.json(), jn, rsn)
-                    if u: print(f"  UUID via direct API: {u}"); return u
+                    if u: print(f"  UUID via workflow: {u}"); return u
                     uuids = UUID_RE.findall(json.dumps(r.json()))
                     if uuids: print(f"  UUID candidates: {uuids[:4]}")
-            except Exception as e:
-                print(f"  S4 exc {base[-30:]}: {e}")
+            except: pass
 
-    # S5: scan the caderno-specific URL for any UUID in its HTML
+    # S5: scan caderno-specific HTML for UUIDs
     try:
-        cad_url = f"{PORTAL_URL}?journalName={jne}&rootSectionName={rsne}"
-        r = session.get(cad_url, timeout=15)
+        r = session.get(f"{PORTAL_URL}?journalName={jne}&rootSectionName={rsne}", timeout=15)
         print(f"  S5 caderno HTML: {r.status_code} | {len(r.text):,} chars")
         if r.status_code==200:
             uuids = list(set(UUID_RE.findall(r.text)))
-            if uuids: print(f"  S5 UUIDs: {uuids[:6]}")
-            if len(uuids)==1: return uuids[0]
             ed_paths = re.findall(r'/editions/([0-9a-f-]{36})', r.text, re.I)
+            if uuids:   print(f"  S5 UUIDs: {uuids[:6]}")
             if ed_paths: return ed_paths[0]
+            if len(uuids)==1: return uuids[0]
     except Exception as e: print(f"  S5 err: {e}")
 
     print(f"  UUID não encontrado para {lbl}")
     return None
 
 # ===========================================================================
-# MINIMAL PDF FALLBACK
-# When UUID found but search API unavailable:
-# Download only first MAX_PDF_PAGES pages to extract structural references.
+# PDF FALLBACK (minimal download — first MAX_PDF_PAGES pages only)
 # ===========================================================================
-MAX_PDF_PAGES = 15
-
 def baixar_pdf_parcial(session, uuid):
     url = f"{PDF_API}/v1/editions/{uuid}"
-    print(f"  PDF {url[-50:]}")
+    print(f"  PDF {url[-55:]}")
     try:
         r = session.get(url, timeout=120, stream=True)
-        if r.status_code != 200: print(f"  PDF HTTP {r.status_code}"); return None
+        if r.status_code!=200: print(f"  PDF HTTP {r.status_code}"); return None
         data = b"".join(r.iter_content(65536))
-        if data[:4] != b"%PDF": return None
-        print(f"  PDF OK {len(data)/1e6:.1f} MB"); return data
+        if data[:4]!=b"%PDF": return None
+        print(f"  PDF OK {len(data)/1e6:.1f}MB"); return data
     except Exception as e: print(f"  PDF err: {e}"); return None
 
 def extract_text_partial(pdf_bytes, label=""):
-    """pdfminer 2-col, max MAX_PDF_PAGES pages."""
     try:
         from pdfminer.high_level import extract_pages
         from pdfminer.layout import LTTextBox, LAParams
         lp = LAParams(line_margin=0.3, char_margin=2.0, word_margin=0.1, boxes_flow=None)
         parts=[]
-        for i, page in enumerate(extract_pages(io.BytesIO(pdf_bytes), laparams=lp)):
-            if i >= MAX_PDF_PAGES: break
-            mid = page.width * 0.52
-            boxes = [(el.bbox[3],(el.bbox[0]+el.bbox[2])/2,el.get_text())
-                     for el in page if isinstance(el, LTTextBox) and el.get_text().strip()]
+        for i,page in enumerate(extract_pages(io.BytesIO(pdf_bytes), laparams=lp)):
+            if i>=MAX_PDF_PAGES: break
+            mid=page.width*0.52
+            boxes=[(el.bbox[3],(el.bbox[0]+el.bbox[2])/2,el.get_text())
+                   for el in page if isinstance(el,LTTextBox) and el.get_text().strip()]
             left  = sorted([(y,t) for y,x,t in boxes if x<mid],  reverse=True)
             right = sorted([(y,t) for y,x,t in boxes if x>=mid], reverse=True)
             parts.append("\n".join(t.strip() for _,t in left+right))
             parts.append("\x0c")
         result="\n".join(parts)
-        print(f"  text {len(result):,} chars ({label}, {MAX_PDF_PAGES}pp max)")
+        print(f"  texto {len(result):,} chars ({MAX_PDF_PAGES}pp max)")
         return result
     except Exception as e:
         print(f"  pdfminer err: {e}"); return ""
 
-def scan_text_for_refs(full_text, caderno, date_str):
-    """
-    Window-based scan of extracted text.
-    Returns reference dicts compatible with the search-based format.
-    """
-    fn = normalize(full_text)
-    lbl, jn, rsn, emo = (caderno["label"], caderno["journalName"],
-                          caderno["rootSectionName"], caderno["emoji"])
-    page_breaks = [(m.start(), f"p.{i+2}")
-                   for i,m in enumerate(re.finditer(r"\x0c", full_text))]
+def scan_text_for_refs(full_text, caderno):
+    fn=normalize(full_text); lbl=caderno["label"]; jn=caderno["journalName"]; rsn=caderno["rootSectionName"]
+    page_breaks=[(m.start(),f"p.{i+2}") for i,m in enumerate(re.finditer(r"\x0c",full_text))]
     def pag(pos):
         p="p.1"
         for pb,pl in page_breaks:
             if pb<=pos: p=pl
             else: break
         return p
-
     results=[]; seen=set()
     for kw in KEYWORDS:
-        kn = normalize(kw)
-        sp=0
+        kn=normalize(kw); sp=0
         while True:
             pos=fn.find(kn,sp)
             if pos==-1: break
             sp=pos+max(len(kn),400)
-            dedup=(kw, pag(pos))
+            dedup=(kw,pag(pos))
             if dedup in seen: continue
             seen.add(dedup)
-            win = re.sub(r"\s+"," ", full_text[max(0,pos-150):pos+300]).strip()
-            # Find nearest document header
-            doc_header = ""
-            before = full_text[max(0,pos-800):pos]
-            for pat in [
-                r'((?:PORTARIA|RESOLUÇÃO|DECRETO|DESPACHO|EXTRATO)\s+[^\n]{10,80})',
-                r'((?:PORTARIA|RESOLUCAO|DECRETO)\s+\w[\w\s./]+)',
-            ]:
-                m = re.findall(pat, before, re.I)
-                if m: doc_header = m[-1].strip()[:100]; break
-            ref = {
-                "keyword": kw, "label": lbl,
-                "journal": jn, "section": rsn,
-                "title": doc_header,
-                "page": pag(pos),
-                "excerpt": win[:300],
-                "edition_id": "", "doc_type": "",
-            }
-            exc_low = normalize(win)
-            v, sc, ft = score_ref(ref, exc_low)
+            win=re.sub(r"\s+"," ",full_text[max(0,pos-150):pos+300]).strip()
+            doc_header=""
+            before=full_text[max(0,pos-800):pos]
+            for pat in [r'((?:PORTARIA|RESOLUÇÃO|DECRETO|DESPACHO|EXTRATO)\s+[^\n]{10,80})',]:
+                m=re.findall(pat,before,re.I)
+                if m: doc_header=m[-1].strip()[:100]; break
+            ref={"keyword":kw,"label":lbl,"journal":jn,"section":rsn,
+                 "title":doc_header,"page":pag(pos),"excerpt":win[:300],
+                 "edition_id":"","attach_id":"","doc_type":"","date":""}
+            v,sc,ft=score_ref(ref, normalize(win))
             results.append({"ref":ref,"veredito":v,"score":sc,"fatores":ft,"keyword":kw})
-
     ap=sum(1 for r in results if r["veredito"].startswith("🟢"))
     pr=sum(1 for r in results if r["veredito"].startswith("🟡"))
     print(f"  {lbl}: {len(results)} refs via PDF | 🟢{ap} 🟡{pr}")
@@ -700,24 +659,22 @@ def scan_text_for_refs(full_text, caderno, date_str):
 # TELEGRAM
 # ===========================================================================
 _last_send = 0.0
-
 def send_telegram(text, silent=False):
     global _last_send
-    gap = time.time()-_last_send
-    if gap < 2.0: time.sleep(2.0-gap)
+    gap=time.time()-_last_send
+    if gap<2.0: time.sleep(2.0-gap)
     for _ in range(3):
         try:
-            r = requests.post(
+            r=requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id":CHAT_ID,"text":text,"parse_mode":"Markdown",
                       "disable_web_page_preview":True,"disable_notification":silent},
                 timeout=15)
-            _last_send = time.time()
+            _last_send=time.time()
             if r.status_code==200: return True
             if r.status_code==429:
-                time.sleep(r.json().get("parameters",{}).get("retry_after",30)+1)
-                continue
-            print(f"  TG {r.status_code}: {r.text[:80]}"); return False
+                time.sleep(r.json().get("parameters",{}).get("retry_after",30)+1); continue
+            print(f"  TG {r.status_code}: {r.text[:60]}"); return False
         except Exception as e: print(f"  TG err: {e}"); time.sleep(3)
     return False
 
@@ -734,29 +691,31 @@ def split_long(text, max_len=3800):
 # MAIN
 # ===========================================================================
 def main():
-    hoje  = datetime.date.today()
+    hoje     = datetime.date.today()
     date_str = hoje.strftime("%d/%m/%Y")
     print(f"=== {SOURCE_NAME} Monitor v4.0 — {date_str} ===\n")
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      json={"chat_id":CHAT_ID,
+                            "text":f"⏳ DOESP v4.0 iniciado — {date_str}",
+                            "disable_notification":True}, timeout=10)
+    except: pass
 
     session = requests.Session()
     session.headers.update({
-        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        "User-Agent":("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
         "Accept":          "application/json,text/html,*/*;q=0.9",
         "Accept-Language": "pt-BR,pt;q=0.9",
         "Origin":          "https://doe.sp.gov.br",
         "Referer":         "https://doe.sp.gov.br/",
     })
 
-    # -----------------------------------------------------------------------
-    # 1. Discover search endpoint
-    # -----------------------------------------------------------------------
     search_fn = discover_search_endpoint(session)
-    mode = "search API" if search_fn else "UUID + PDF parcial"
+    mode = "search API ✅" if search_fn else "UUID + PDF parcial"
     print(f"\n  Modo: {mode}\n")
 
     results_by_caderno = {}
-
     for caderno in CADERNOS:
         lbl, emo = caderno["label"], caderno["emoji"]
         print(f"\n{'─'*60}")
@@ -764,51 +723,42 @@ def main():
         print(f"{'─'*60}")
 
         if search_fn:
-            # PRIMARY PATH: use search API
             hits = scan_via_search(session, search_fn, caderno, date_str)
         else:
-            # FALLBACK: UUID + minimal PDF
             uuid = get_uuid_fallback(session, caderno)
             if not uuid:
                 send_telegram(
-                    f"⚠️ *{SOURCE_NAME} — {date_str}*\n"
-                    f"{emo} [{lbl}] UUID não encontrado\n"
+                    f"⚠️ *DOESP {date_str}* — {emo} [{lbl}]\n"
+                    f"UUID não encontrado. API ainda inacessível.\n"
                     f"🔗 [Verificar manualmente]({caderno_url(caderno['journalName'],caderno['rootSectionName'])})")
-                results_by_caderno[lbl] = []; continue
+                results_by_caderno[lbl]=[]; continue
             pdf = baixar_pdf_parcial(session, uuid)
-            if not pdf:
-                results_by_caderno[lbl] = []; continue
+            if not pdf: results_by_caderno[lbl]=[]; continue
             text = extract_text_partial(pdf, lbl)
-            if not text:
-                results_by_caderno[lbl] = []; continue
-            hits = scan_text_for_refs(text, caderno, date_str)
+            if not text: results_by_caderno[lbl]=[]; continue
+            hits = scan_text_for_refs(text, caderno)
 
         results_by_caderno[lbl] = hits
         time.sleep(1)
 
-    # -----------------------------------------------------------------------
-    # 2. Summarize
-    # -----------------------------------------------------------------------
     total = sum(len(v) for v in results_by_caderno.values())
     print(f"\n{'='*60}\nTOTAL: {total} ({mode})")
 
-    if total == 0:
-        # Show what cadernos were found even with 0 results
-        lines = [f"✅ *{SOURCE_NAME} — {date_str}* ({mode})",
-                 "Nenhuma ocorrência nos cadernos monitorados."]
+    if total==0:
+        lines=[f"✅ *{SOURCE_NAME} — {date_str}*",
+               f"Modo: {mode}",
+               "Nenhuma ocorrência nos cadernos monitorados."]
         for cad in CADERNOS:
-            lines.append(f"{cad['emoji']} [{cad['label']}] — "
-                         f"[Ver caderno]({caderno_url(cad['journalName'],cad['rootSectionName'])})")
-        send_telegram("\n".join(lines))
-        return
+            lines.append(f"{cad['emoji']} [{cad['label']}] "
+                         f"[Abrir caderno]({caderno_url(cad['journalName'],cad['rootSectionName'])})")
+        send_telegram("\n".join(lines)); return
 
     all_hits = [h for v in results_by_caderno.values() for h in v]
     send_telegram(build_summary(results_by_caderno, date_str, mode))
     time.sleep(1)
 
-    # 3. Send ref cards: approved first, then pode render, then background (silent)
-    aprovadas   = sorted([h for h in all_hits if h["veredito"].startswith("🟢")], key=lambda x: -x["score"])
-    pode_render = sorted([h for h in all_hits if h["veredito"].startswith("🟡")], key=lambda x: -x["score"])
+    aprovadas   = sorted([h for h in all_hits if h["veredito"].startswith("🟢")], key=lambda x:-x["score"])
+    pode_render = sorted([h for h in all_hits if h["veredito"].startswith("🟡")], key=lambda x:-x["score"])
     background  =        [h for h in all_hits if h["veredito"].startswith("🔴")]
 
     for h in aprovadas + pode_render:
@@ -817,16 +767,14 @@ def main():
         time.sleep(0.5)
 
     if background:
-        lines = [f"🗂️ *Background DOESP — {date_str}* — {len(background)} ref(s)"]
+        lines=[f"🗂️ *Background DOESP — {date_str}* — {len(background)} ref(s)"]
         for h in background[:20]:
-            cat = KEYWORD_CATEGORIES.get(h["keyword"],"general")
-            _, icon, _ = CATEGORY_TV.get(cat,(3,"🔍",""))
-            ref = h["ref"]
-            lbl2 = ref.get("label","")
-            pg = f" {ref.get('page','')}" if ref.get("page") else ""
-            title = ref.get("title","")[:40]
-            lines.append(f"{icon} `{h['keyword'][:30]}` [{lbl2}]{pg} {title}")
+            cat=KEYWORD_CATEGORIES.get(h["keyword"],"general")
+            _,icon,_=CATEGORY_TV.get(cat,(3,"🔍",""))
+            r=h["ref"]; pg=f" {r.get('page','')}" if r.get("page") else ""
+            ttl=(r.get("title") or "")[:35]
+            lines.append(f"{icon} `{h['keyword'][:30]}` [{r.get('label','')}]{pg} {ttl}")
         send_telegram("\n".join(lines), silent=True)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
