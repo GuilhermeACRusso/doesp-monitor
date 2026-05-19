@@ -2,28 +2,36 @@ name: DOESP Monitor
 
 on:
   schedule:
-    # 07:30 BRT (UTC-3) = 10:30 UTC, segunda a sexta
+    # 10:30 UTC = 07:30 BRT (antes da publicação das ~08h)
+    # Ajustar para 12:00 UTC = 09:00 BRT se publicação atrasar
     - cron: '30 10 * * 1-5'
   workflow_dispatch:
 
 jobs:
-  scan:
+  scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
-      - name: Instalar dependências
+      - name: Install Python dependencies
         run: |
-          pip install requests pdfplumber "pdfminer.six>=20221105"
+          pip install --upgrade pip
+          pip install requests pdfplumber "pdfminer.six>=20221105" playwright
 
-      - name: Rodar monitor
+      - name: Install Playwright + Chromium
+        # --with-deps instala todas as dependências de sistema (libglib2, libnss, etc.)
+        run: playwright install chromium --with-deps
+
+      - name: Run DOESP Monitor
+        run: python main.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID:        ${{ secrets.CHAT_ID }}
-        run: python main.py
+          CHAT_ID: ${{ secrets.CHAT_ID }}
