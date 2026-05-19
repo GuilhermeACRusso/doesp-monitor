@@ -271,81 +271,207 @@ def _strat1(session, html, jn, rsn):
     if not m: return None
     try: data = json.loads(m.group(1))
     except: return None
-    if not data.get("props",{}).get("pageProps",{}): return None
+    # FIX: never bail on empty pageProps — CSR apps always have pageProps:{}.
+    # Scan ALL of __NEXT_DATA__ incl. runtimeConfig, query, buildManifest.
+    keys = list(data.keys())
+    print(f"    __NEXT_DATA__ keys: {keys[:8]}")
+    # Extract any API base URL from runtimeConfig
+    for key in ("API_BASE_URL","NEXT_PUBLIC_API_URL","API_URL","publicRuntimeConfig","runtimeConfig"):
+        val = data.get(key) or data.get("props",{}).get(key)
+        if val: print(f"    cfg.{key}: {str(val)[:120]}")
     u = _best_uuid(data, jn, rsn)
-    if u: print(f"    S1: {u}")
+    if u: print(f"    ✅ S1: {u}")
     return u
 
 def _strat2(session, build_id, jn, rsn):
     if not build_id: return None
-    for p in [f"?journalName={requests.utils.quote(jn)}&rootSectionName={requests.utils.quote(rsn)}", ""]:
+    jne, rsne = requests.utils.quote(jn), requests.utils.quote(rsn)
+    # Try multiple ISR/SSG data path patterns for this Next.js app
+    paths = [
+        f"sumario.json?journalName={jne}&rootSectionName={rsne}",
+        f"sumario.json",
+        f"sumario/{jne}/{rsne}.json",
+        f"sumario/{jne}.json",
+    ]
+    for p in paths:
+        url = f"https://doe.sp.gov.br/_next/data/{build_id}/{p}"
         try:
-            r = session.get(f"https://doe.sp.gov.br/_next/data/{build_id}/sumario.json{p}", timeout=10)
+            r = session.get(url, timeout=10)
+            print(f"    S2 {r.status_code} {url[-60:]}")
             if r.status_code == 200:
-                u = _best_uuid(r.json(), jn, rsn)
-                if u: print(f"    S2: {u}"); return u
+                try: data = r.json()
+                except: continue
+                u = _best_uuid(data, jn, rsn)
+                if u: print(f"    ✅ S2: {u}"); return u
+                all_u = _all_uuids_in_obj(data)
+                if all_u: print(f"    S2 uuids: {[v for _,v in all_u[:4]]}")
+                if len(all_u) == 1: return all_u[0][1]
         except: pass
     return None
 
 def _strat3(session, html, jn, rsn):
-    api_base = None
-    for src in re.findall(r'/_next/static/[^"\'<>\s]+\.js', html)[:20]:
+    """Scan all JS bundles for any doe.sp.gov.br API base URL. Verbose logging."""
+    hoje = datetime.date.today().isoformat()
+    jne  = requests.utils.quote(jn)
+    rsne = requests.utils.quote(rsn)
+    js_srcs = re.findall(r'/_next/static/[^"\'<>\s]+\.js', html)
+    print(f"    S3: {len(js_srcs)} JS files in HTML")
+    found_bases = set()
+    for i, src in enumerate(js_srcs[:40]):
         try:
             r = session.get(f"https://doe.sp.gov.br{src}", timeout=8)
-            if r.status_code == 200:
-                bases = set(re.findall(r'https?://do-api[a-z0-9.-]+\.doe\.sp\.gov\.br', r.text))
-                if bases: api_base = list(bases)[0]; break
-        except: pass
-    if not api_base: return None
-    hoje = datetime.date.today().isoformat()
-    jne, rsne = requests.utils.quote(jn), requests.utils.quote(rsn)
-    for path in [
-        f"/v1/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
-        f"/v1/editions?journalName={jne}&rootSectionName={rsne}",
-        f"/v1/editions?date={hoje}",
-    ]:
-        try:
-            r = session.get(api_base+path, timeout=10)
-            if r.status_code == 200:
-                u = _best_uuid(r.json(), jn, rsn)
-                if u: print(f"    S3: {u}"); return u
-        except: pass
+            if r.status_code != 200:
+                if i < 4: print(f"    S3 bundle[{i}] HTTP {r.status_code}")
+                continue
+            js = r.text
+            # Broad: any subdomain of doe.sp.gov.br
+            bases  = set(re.findall(r'https?://[a-z0-9.-]+\.doe\.sp\.gov\.br', js))
+            bases |= set(re.findall(r'https?://do-api[a-z0-9.-]+\.sp\.gov\.br', js))
+            # Partial domain tokens (catches split strings in minified JS)
+            partials = re.findall(r'"(do-api[a-z0-9-]+)"', js)
+            if partials: print(f"    S3 partial tokens: {partials[:4]}")
+            # Full /editions/ URLs
+            ed_urls = re.findall(r'https?://[^"\'\s]+/(?:v\d/)?editions[^"\'\s]*', js)
+            if ed_urls: print(f"    S3 editions URLs: {ed_urls[:3]}")
+            for eu in ed_urls:
+                m = re.match(r'(https?://[^/]+)', eu)
+                if m: bases.add(m.group(1))
+            found_bases |= bases
+            if bases and i < 5: print(f"    S3 bundle[{i}] bases: {list(bases)[:3]}")
+        except Exception as e:
+            if i < 4: print(f"    S3 bundle[{i}] err: {e}")
+    if not found_bases:
+        print("    S3: no API bases found in any JS bundle")
+        return None
+    print(f"    S3 total bases: {list(found_bases)[:5]}")
+    for api_base in list(found_bases):
+        for path in [
+            f"/v1/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
+            f"/v1/editions?journalName={jne}&rootSectionName={rsne}",
+            f"/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
+            f"/v1/editions?date={hoje}",
+        ]:
+            try:
+                r = session.get(api_base + path, timeout=10)
+                print(f"    S3 API {r.status_code} {(api_base+path)[-70:]}")
+                if r.status_code == 200:
+                    try: data = r.json()
+                    except: continue
+                    u = _best_uuid(data, jn, rsn)
+                    if u: print(f"    ok S3: {u}"); return u
+                    all_u = _all_uuids_in_obj(data)
+                    if all_u:
+                        print(f"    S3 uuids: {[v for _,v in all_u[:4]]}")
+                        if len(all_u) == 1: return all_u[0][1]
+            except: pass
     return None
 
 def _strat4(session, jn, rsn):
+    """Hardcoded API domains - verbose HTTP status for every call."""
     hoje = datetime.date.today().isoformat()
-    jne, rsne = requests.utils.quote(jn), requests.utils.quote(rsn)
-    for url in [
+    jne  = requests.utils.quote(jn)
+    rsne = requests.utils.quote(rsn)
+    urls = [
         f"{PDF_API_BASE}/v1/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
         f"{PDF_API_BASE}/v1/editions?journalName={jne}&rootSectionName={rsne}",
+        f"{PDF_API_BASE}/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
+        f"{PDF_API_BASE}/v1/editions/today?journalName={jne}&rootSectionName={rsne}",
         f"{ADMIN_API}/v1/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
+        f"{ADMIN_API}/v1/editions?journalName={jne}&rootSectionName={rsne}",
         f"{ADMIN_API}/api/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
-    ]:
+        f"{ADMIN_API}/v1/editions/today?journalName={jne}&rootSectionName={rsne}",
+    ]
+    for url in urls:
         try:
             r = session.get(url, timeout=10)
+            print(f"    S4 {r.status_code} {url[8:][-70:]}")
             if r.status_code == 200:
-                u = _best_uuid(r.json(), jn, rsn)
-                if u: print(f"    S4: {u}"); return u
-        except: pass
+                try: data = r.json()
+                except:
+                    print(f"    S4 non-JSON: {r.text[:80]}")
+                    continue
+                u = _best_uuid(data, jn, rsn)
+                if u: print(f"    ok S4: {u}"); return u
+                all_u = _all_uuids_in_obj(data)
+                print(f"    S4 200 uuids: {[v for _,v in all_u[:4]]}")
+                if len(all_u) == 1: return all_u[0][1]
+            elif r.status_code not in (404, 403):
+                print(f"    S4 body: {r.text[:80]}")
+        except Exception as e:
+            print(f"    S4 exc {url[-40:]}: {e}")
     return None
 
 def _strat5(session, jn, rsn):
+    """Same-domain API + fetch the caderno-specific page and scan for UUIDs in HTML."""
     hoje = datetime.date.today().isoformat()
     jne, rsne = requests.utils.quote(jn), requests.utils.quote(rsn)
+    # A: Same-domain API routes
     for url in [
         f"https://doe.sp.gov.br/api/editions?journalName={jne}&rootSectionName={rsne}&date={hoje}",
         f"https://doe.sp.gov.br/api/editions?journalName={jne}&rootSectionName={rsne}",
         f"https://doe.sp.gov.br/api/cadernos?date={hoje}",
+        f"https://doe.sp.gov.br/api/sumario?journalName={jne}&rootSectionName={rsne}",
+        f"https://doe.sp.gov.br/api/publication?journalName={jne}&rootSectionName={rsne}&date={hoje}",
     ]:
         try:
             r = session.get(url, timeout=10)
+            print(f"    S5a {r.status_code} {url[-65:]}")
             if r.status_code == 200:
-                data = r.json()
+                try: data = r.json()
+                except: continue
                 u = _best_uuid(data, jn, rsn)
-                if u: print(f"    S5: {u}"); return u
+                if u: print(f"    ✅ S5a: {u}"); return u
                 all_u = _all_uuids_in_obj(data)
-                if len(all_u) == 1: print(f"    S5 sole: {all_u[0][1]}"); return all_u[0][1]
+                if all_u: print(f"    S5a uuids: {[v for _,v in all_u[:4]]}")
+                if len(all_u) == 1: return all_u[0][1]
         except: pass
+    # B: Fetch the specific caderno URL and scan its HTML for UUIDs
+    caderno_url = f"https://doe.sp.gov.br/sumario?journalName={jne}&rootSectionName={rsne}"
+    try:
+        r = session.get(caderno_url, timeout=15)
+        print(f"    S5b caderno page: HTTP {r.status_code} | {len(r.text):,} chars")
+        if r.status_code == 200:
+            html = r.text
+            all_uuids = list(set(re.findall(
+                r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', html, re.I)))
+            print(f"    S5b UUIDs in caderno HTML: {all_uuids[:8]}")
+            # Also look for any /editions/ paths or PDF links
+            edition_paths = re.findall(r'/editions/([0-9a-f-]{36})', html, re.I)
+            if edition_paths: print(f"    S5b /editions/ paths: {edition_paths[:4]}")
+            # Try to use __NEXT_DATA__ from this specific page
+            m = re.search(r'__NEXT_DATA__[^>]*>(.*?)</script>', html, re.DOTALL)
+            if m:
+                try:
+                    page_data = json.loads(m.group(1))
+                    u = _best_uuid(page_data, jn, rsn)
+                    if u: print(f"    ✅ S5b __NEXT_DATA__: {u}"); return u
+                except: pass
+            if len(all_uuids) == 1: return all_uuids[0]
+            if edition_paths: return edition_paths[0]
+    except Exception as e:
+        print(f"    S5b error: {e}")
+    return None
+
+def _strat6_html_scan(session, html, jn, rsn):
+    """Last resort: scan the HTML for UUIDs, /editions/ paths, and PDF hrefs."""
+    all_uuids = list(set(re.findall(
+        r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', html, re.I)))
+    edition_paths = re.findall(r'/editions/([0-9a-f-]{36})', html, re.I)
+    pdf_hrefs = re.findall(r'href=["\']([^"\']*edition[^"\']*)["\']', html, re.I)
+    print(f"    S6 UUIDs in main HTML: {all_uuids[:6]}")
+    if edition_paths: print(f"    S6 /editions/ paths: {edition_paths[:4]}")
+    if pdf_hrefs: print(f"    S6 PDF hrefs: {pdf_hrefs[:3]}")
+    jn_low = jn.lower().replace(" ",""); rsn_low = rsn.lower().replace(" ","")
+    # Return UUID that appears near journalName/rootSectionName context
+    for uid in (edition_paths + all_uuids):
+        ctx = html[max(0,html.lower().find(uid.lower())-200):
+                   html.lower().find(uid.lower())+200].lower()
+        if jn_low in ctx or rsn_low in ctx:
+            print(f"    ✅ S6 contextual: {uid}"); return uid
+    if len(all_uuids) == 1:
+        print(f"    ✅ S6 sole UUID: {all_uuids[0]}"); return all_uuids[0]
+    if len(edition_paths) == 1:
+        print(f"    ✅ S6 edition path: {edition_paths[0]}"); return edition_paths[0]
     return None
 
 def get_uuid_for_caderno(session, caderno):
@@ -359,13 +485,19 @@ def get_uuid_for_caderno(session, caderno):
         lambda: _strat3(session, html, jn, rsn),
         lambda: _strat4(session, jn, rsn),
         lambda: _strat5(session, jn, rsn),
+        lambda: _strat6_html_scan(session, html, jn, rsn),
     ], start=1):
         print(f"    [S{n}]", end=" ")
         try:
             u = strat()
             if u: return u
         except Exception as e: print(f"Erro: {e}")
-    print(f"  Falhou {lbl}"); return None
+    # Final fallback: dump first 2000 chars of HTML for manual diagnosis
+    print(f"  Falhou {lbl}")
+    print(f"  HTML preview: {html[:300].replace(chr(10),' ')}")
+    html_uuids = re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', html, re.I)
+    if html_uuids: print(f"  UUIDs anywhere in HTML: {html_uuids[:8]}")
+    return None
 
 def baixar_pdf(session, uuid):
     url = f"{PDF_API_BASE}/v1/editions/{uuid}"
