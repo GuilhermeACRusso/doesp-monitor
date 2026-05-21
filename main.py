@@ -1,29 +1,4 @@
-"""
-DOESP Monitor v5.3 — Diário Oficial do Estado de São Paulo
-===========================================================
-v5.2 confirmed: Playwright click navigation works. API fully mapped.
-
-ARCHITECTURE v5.3:
-  1. Playwright: loads page → clicks caderno → clicks section
-  2. Intercepts 4 API responses after section click:
-     a) /v1/editions/status      → all edition IDs
-     b) ?EditionDate=...         → PDF UUID for this caderno+section
-     c) ?name=publications       → paginated list (title + excerpt)
-     d) ?JournalId=&SectionId=   → TREE STRUCTURE (ALL publications, not paginated)
-  3. Parses TREE STRUCTURE recursively → every publication title + hierarchy path
-     (330-1860 pubs per section, vs 10 from DOM page 1)
-  4. Scans titles for keywords with KEYWORD_FILTERS
-  5. Builds ficha with clear hierarchy:
-     📋 Executivo > Atos Normativos > CASA CIVIL > Subsecretaria...
-
-Improvements over v5.2:
-  - Reads ALL publications via tree API (not just DOM page 1)
-  - KEYWORD_FILTERS ported from DOC-SP (require_any, skip_if, max_hits)
-  - Clear hierarchy labels (caderno > seção > órgão > divisão)
-  - TV scoring with state-specific bonuses
-  - Field extraction (valor, CNPJ, empresa) from excerpts
-  - PDF UUID correctly extracted for optional download
-"""
+"""DOESP Monitor v5.3 — Clean structured extraction, no raw context dumps."""
 
 import requests, datetime, os, sys, re, json, unicodedata, io, time
 
@@ -33,24 +8,17 @@ if not TELEGRAM_TOKEN or not CHAT_ID:
     print("FATAL: TELEGRAM_TOKEN ou CHAT_ID ausentes."); sys.exit(1)
 
 CADERNOS = [
-    {"journalName":"Executivo",  "rootSectionName":"Atos Normativos",
-     "label":"Normativos", "emoji":"📋"},
-    {"journalName":"Executivo",  "rootSectionName":"Atos de Pessoal",
-     "label":"Pessoal",    "emoji":"👤"},
-    {"journalName":"Executivo",  "rootSectionName":"Atos de Gestão e Despesas",
-     "label":"Gestão",     "emoji":"💼"},
-    {"journalName":"Municípios", "rootSectionName":"Atos Municipais",
-     "label":"Municípios", "emoji":"🏛️"},
+    {"journalName":"Executivo",  "rootSectionName":"Atos Normativos",    "label":"Normativos","emoji":"📋"},
+    {"journalName":"Executivo",  "rootSectionName":"Atos de Pessoal",    "label":"Pessoal",   "emoji":"👤"},
+    {"journalName":"Executivo",  "rootSectionName":"Atos de Gestão e Despesas","label":"Gestão","emoji":"💼"},
+    {"journalName":"Municípios", "rootSectionName":"Atos Municipais",    "label":"Municípios","emoji":"🏛️"},
 ]
 
-SOURCE_NAME  = "DOESP"
-PORTAL_URL   = "https://doe.sp.gov.br/sumario"
-PDF_API      = "https://do-api-publication-pdf.doe.sp.gov.br"
-UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I)
+PORTAL_URL = "https://doe.sp.gov.br/sumario"
+PDF_API    = "https://do-api-publication-pdf.doe.sp.gov.br"
+UUID_RE    = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I)
 
-# ===========================================================================
-# KEYWORDS + FILTERS (ported from DOC-SP v9.3 + DOESP v2)
-# ===========================================================================
+# ── KEYWORDS ──────────────────────────────────────────────────────
 KEYWORD_CATEGORIES = {
     "contratação emergencial":"urgencia","organização social de saúde":"saude",
     "contrato de gestão":"saude","hospital das clínicas":"saude",
@@ -82,7 +50,6 @@ KEYWORD_CATEGORIES = {
     "exoneração a pedido":"pessoal","exoneração de servidor":"pessoal",
 }
 KEYWORDS = sorted(KEYWORD_CATEGORIES.keys(), key=len, reverse=True)
-
 CATEGORY_TV = {
     "urgencia":(1,"🚨","Emergência"),"saude":(1,"🏥","Saúde"),
     "investigativo":(1,"🔎","Investigativo"),"obras":(2,"🏗️","Obras"),
@@ -93,44 +60,28 @@ CATEGORY_TV = {
     "orcamento":(3,"💼","Orçamento"),"pessoal":(3,"👤","Pessoal"),
     "general":(3,"🔍","Geral"),
 }
-
 KEYWORD_FILTERS = {
-    "extrato de contrato":{"max_hits":20,
-        "require_any":["cnpj","contratad","objeto","contratante","valor"]},
-    "termo de aditamento":{"max_hits":15,
-        "require_any":["cnpj","contratad","valor","objeto","aditamento"]},
-    "dispensa de licitação":{"max_hits":15,
-        "require_any":["autorizo","homologo","contratad","valor","objeto","dispensa"],
-        "skip_if":["resultou fracassada"]},
+    "extrato de contrato":{"max_hits":20,"require_any":["cnpj","contratad","objeto","valor"]},
+    "termo de aditamento":{"max_hits":15,"require_any":["cnpj","contratad","valor","aditamento"]},
+    "dispensa de licitação":{"max_hits":15,"require_any":["autorizo","homologo","contratad","valor","dispensa"],"skip_if":["resultou fracassada"]},
     "inexigibilidade de licitação":{"min_value":50_000},
-    "aplicação de penalidade":{"max_hits":10,
-        "require_any":["aplico","notifico","suspensão","multa","pena"]},
-    "sindicância":{"max_hits":10,
-        "require_any":["instaurar","instaurada","conclusão","arquivada","pena","aplico"]},
-    "processo administrativo disciplinar":{"max_hits":8,
-        "require_any":["instaurado","instaurada","corregedoria","demissão","suspensão","aplico"]},
+    "aplicação de penalidade":{"max_hits":10,"require_any":["aplico","notifico","suspensão","multa","pena"]},
+    "sindicância":{"max_hits":10,"require_any":["instaurar","instaurada","conclusão","arquivada","pena","aplico"]},
+    "processo administrativo disciplinar":{"max_hits":8,"require_any":["instaurado","instaurada","corregedoria","demissão","suspensão","aplico"]},
     "organização social de saúde":{"require_any":["contrato de gestão","os ","spdm","hospital"]},
     "CETESB":{"require_any":["multa","embargo","auto de infração","licença"]},
-    "dengue":{"require_any":["caso","foco","combate","surto","contrato"],
-              "skip_if":["projeto de lei"]},
-    "superfaturamento":{
-        "require_any":["apurou","indício","constatou","investigação","TCE","MP "],
-        "skip_if":["evitar superfaturamento","vedado o superfaturamento"]},
-    "sobrepreço":{
-        "require_any":["apurou","indício","constatou","investigação"],
-        "skip_if":["evitar contratações com sobrepreço"]},
+    "dengue":{"require_any":["caso","foco","combate","surto","contrato"],"skip_if":["projeto de lei"]},
+    "superfaturamento":{"require_any":["apurou","indício","constatou","investigação","TCE","MP "],"skip_if":["evitar superfaturamento"]},
+    "sobrepreço":{"require_any":["apurou","indício","constatou"],"skip_if":["evitar contratações com sobrepreço"]},
     "nomeação para cargo em comissão":{"max_hits":8},
     "exoneração a pedido":{"max_hits":8},
     "exoneração de servidor":{"max_hits":8},
     "demissão de servidor":{"max_hits":5},
 }
 
-# ===========================================================================
-# HELPERS
-# ===========================================================================
+# ── HELPERS ───────────────────────────────────────────────────────
 def normalize(t):
-    return "".join(c for c in unicodedata.normalize("NFKD",t)
-                   if not unicodedata.combining(c)).lower()
+    return "".join(c for c in unicodedata.normalize("NFKD",t) if not unicodedata.combining(c)).lower()
 def parse_brl(s):
     if not s: return 0.0
     m=re.search(r"[\d.,]+",s)
@@ -139,196 +90,322 @@ def parse_brl(s):
     try: return float(v)
     except: return 0.0
 def caderno_url(jn, rsn):
-    return (f"{PORTAL_URL}?journalName={requests.utils.quote(jn)}"
-            f"&rootSectionName={requests.utils.quote(rsn)}")
+    return f"{PORTAL_URL}?journalName={requests.utils.quote(jn)}&rootSectionName={requests.utils.quote(rsn)}"
 
+# ── FIELD EXTRACTION REGEXES (ported from DOC-SP v9.3) ───────────
 _RE_MONEY = re.compile(r'R\$\s*[\d.,]+(?:\s*\([^)]{0,80}\))?', re.I)
 _RE_CNPJ  = re.compile(r'(?<!\d)\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}(?!\d)')
-_RE_SEI   = re.compile(r'\d{3}\.\d{8}/\d{4}[-–]\d{2}')
+_RE_SEI   = re.compile(r'\d{3}\.\d{8}/\d{4}[-\u2013]\d{2}')
+_RE_DATE  = re.compile(r'\b\d{2}/\d{2}/\d{4}\b')
 
-# ===========================================================================
-# TREE PARSER — extract ALL publications from the nested tree API response
-# ===========================================================================
+# Company: labeled > OSC > CAPS (3-tier, from DOC-SP v9.3)
+_RE_EMP_LABELED = re.compile(
+    r'(?:\bempresa\s+|\bCONTRATAD[AO]\s*:?\s*|\bContratad[ao]\s*:?\s*'
+    r'|\bvencedora\b[^.]{0,30}?(?:empresa\s+)?'
+    r'|\bem\s+favor\s+d[ae]\s+(?:empresa\s+)?)'
+    r'([A-Z\u00C0-\u00FF][A-Z\u00C0-\u00FFa-z\u00E0-\u00FF0-9\s&,./()-]{4,100}?'
+    r'\s+(?:LTDA|S/?A|S\.A\.?|EIRELI|EPP|ME)\b)\.?', re.I|re.U)
+_RE_EMP_OSC = re.compile(
+    r'\b(ASSOCIA[ÇC][ÃA]O|FUNDA[ÇC][ÃA]O|INSTITUTO|COOPERATIVA'
+    r'|CONS[ÓO]RCIO|HOSPITAL|SINDICATO|CENTRO)'
+    r'(?:\s+[A-Z\u00C0-\u00FF0-9][\w\u00C0-\u00FF&.-]{1,40}){1,8}', re.U)
+_RE_EMP_CAPS = re.compile(
+    r'(\b[A-Z\u00C0-\u00FF][A-Z\u00C0-\u00FF0-9&./()-]+'
+    r'(?:\s+[A-Z\u00C0-\u00FF][A-Z\u00C0-\u00FF0-9&./()-]+){1,8})'
+    r'\s+(LTDA|S/?A|S\.A\.?|EIRELI|EPP|ME)\b\.?', re.U)
+_CAPS_NOISE = {"EXTRATO","OBJETO","PROCESSO","SECRETARIA","PREFEITURA","DIRETORIA",
+    "CONTRATANTE","CONTRATADA","PORTARIA","DECRETO","RESOLUÇÃO","DESPACHO",
+    "EDITAL","COMUNICADO","PREGÃO","FORNECIMENTO","ELABORAÇÃO","CONSTRUÇÃO"}
+_RE_LEAD = re.compile(r'^(?:DA|DO|DE|DOS|DAS|EM|COM|NA|NO|PELA|PELO)\s+', re.I)
+
+def _clean_co(name):
+    if not name: return None
+    name=name.strip().rstrip('.,;:').lstrip(',. ')
+    for _ in range(3):
+        new=_RE_LEAD.sub('',name).strip()
+        if new==name: break
+        name=new
+    if not name or len(name)<8: return None
+    first=re.split(r'[\s\-]',name)[0].upper()
+    if first in _CAPS_NOISE: return None
+    return name
+
+def get_empresa(text):
+    for m in _RE_EMP_LABELED.finditer(text):
+        n=_clean_co(m.group(1))
+        if n: return n
+    for m in _RE_EMP_OSC.finditer(text):
+        n=_clean_co(m.group(0))
+        if n and len(n.split())>=2: return n
+    for m in _RE_EMP_CAPS.finditer(text):
+        n=_clean_co((m.group(1)+" "+m.group(2)).strip())
+        if n: return n
+    return None
+
+_RE_SERVIDOR = re.compile(
+    r'(?:ao\s+)?(?:ex-)?(?:servidor[ae]?|funcion[aá]ri[oa])\s+'
+    r'([A-Z\u00C0-\u00FF][A-Z\u00C0-\u00FFa-z\u00E0-\u00FF\s]{5,60}?)'
+    r'(?:,?\s*R\.?G\.?\s*[Nn]\.?[º°]?\s*)([\d.xX\-]{5,25})', re.I|re.U)
+
+# Inline label parser: "Contratada: X - CNPJ: Y - Valor: Z" format
+_RE_INLINE = re.compile(
+    r'\b(Contratad[ao]|Contratante|CNPJ(?:/MF)?|Objeto|Valor(?:\s+Total)?'
+    r'|Prazo|Vig[êe]ncia|Processo\s*(?:SEI)?|Modalidade'
+    r'|Data\s+(?:de\s+)?[Aa]ssinatura)\s*:\s*'
+    r'([^\n]{3,250}?)'
+    r'(?=\s*[-\u2013]\s*[A-Z\u00C0-\u00FF][a-z\u00E0-\u00FF]{1,20}\s*:|\.\s*$|\n|$)', re.I)
+
+def extract_fields(title, excerpt, path):
+    """Extract who/what/when/how-much from title + excerpt. DOESP-specific patterns."""
+    f = {}
+    text = (title + " " + excerpt).strip()
+    if not text: return f
+
+    # ── GOVERNMENT BRANCH (from tree path) ──
+    if path:
+        short = path.split(" > ", 1)[1] if " > " in path else path
+        if short: f["orgao"] = short
+
+    # ── ACT TYPE from title ──
+    m = re.match(r"(DECRETO|PORTARIA|RESOLUÇÃO|RESOLUCAO|DESPACHO|EDITAL"
+                 r"|COMUNICADO|EXTRATO|APOSTILA|ATA)\b", title, re.I)
+    if m: f["tipo_ato"] = m.group(1).upper()
+
+    # ── DATE from title: "DE 18 DE MAIO DE 2026" or "DE 19-05-26" ──
+    MESES = {"janeiro":"01","fevereiro":"02","março":"03","marco":"03",
+             "abril":"04","maio":"05","junho":"06","julho":"07",
+             "agosto":"08","setembro":"09","outubro":"10",
+             "novembro":"11","dezembro":"12"}
+    md = re.search(r"DE\s+(\d{1,2})\s+DE\s+(\w+)\s+DE\s+(\d{4})", title, re.I)
+    if md:
+        mes = MESES.get(md.group(2).lower(),"")
+        if mes: f["data"] = f"{md.group(1).zfill(2)}/{mes}/{md.group(3)}"
+    elif not f.get("data"):
+        md2 = re.search(r"DE\s+(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})", title)
+        if md2:
+            y = md2.group(3)
+            if len(y)==2: y = "20"+y
+            f["data"] = f"{md2.group(1).zfill(2)}/{md2.group(2).zfill(2)}/{y}"
+
+    # ── PARSE INLINE LABELS from excerpt: "Contratada: X - CNPJ: Y" ──
+    inline = {}
+    for m in _RE_INLINE.finditer(text):
+        lab = re.sub(r"\s+", " ", m.group(1)).strip().lower()
+        val = m.group(2).strip().rstrip(".,;-\u2013 ")
+        if val and len(val) > 2: inline[lab] = val
+
+    # DOESP-specific labels: "Nº do Processo: X Interessado: Y Assunto: Z"
+    # Uses lookahead to stop at the next label
+    _DOESP_LABELS = r"N[º°]\s*do\s*Processo|Interessado|Assunto|Fundamento\s+Legal"
+    for m in re.finditer(
+        r"\b(" + _DOESP_LABELS + r")\s*:\s*(.+?)(?=\s+(?:" + _DOESP_LABELS + r")\s*:|\n|$)",
+        text, re.I):
+        lab = re.sub(r"\s+", " ", m.group(1)).strip().lower()
+        val = m.group(2).strip().rstrip(".,;- ")
+        if val and len(val) > 2: inline[lab] = val[:100]
+
+    # ── COMPANY ──
+    emp = inline.get("contratada") or inline.get("contratado")
+    if emp: f["empresa"] = (_clean_co(emp) or emp)[:80]
+    elif v := get_empresa(text): f["empresa"] = v
+
+    # ── CNPJ ──
+    ci = inline.get("cnpj") or inline.get("cnpj/mf")
+    if ci:
+        m = _RE_CNPJ.search(ci)
+        f["cnpj"] = m.group(0) if m else ci[:20]
+    elif m := _RE_CNPJ.search(text): f["cnpj"] = m.group(0)
+
+    # ── VALUE ──
+    vi = inline.get("valor") or inline.get("valor total")
+    if vi:
+        m = _RE_MONEY.search(vi)
+        f["valor"] = m.group(0) if m else vi[:30]
+    elif m := _RE_MONEY.search(text): f["valor"] = m.group(0)
+
+    # ── OBJECT ──
+    oi = inline.get("objeto")
+    if oi: f["objeto"] = oi[:150]
+    else:
+        m = re.search(r"[Oo]bjeto\s*:\s*(.{10,200}?)(?:\.\s+[A-Z]|\n|$)", text)
+        if m: f["objeto"] = m.group(1).strip()[:150]
+
+    # ── PROCESS / SEI ──
+    proc = inline.get("nº do processo") or inline.get("processo sei") or inline.get("processo")
+    if proc: f["processo"] = proc[:50]
+    elif m := _RE_SEI.search(text): f["sei"] = m.group(0)
+
+    # ── PRAZO / VIGÊNCIA ──
+    pr = inline.get("prazo") or inline.get("vigência") or inline.get("vigencia")
+    if pr: f["prazo"] = pr[:50]
+
+    # ── DATE from excerpt (fallback) ──
+    if not f.get("data"):
+        di = inline.get("data de assinatura") or inline.get("data assinatura")
+        if di: f["data"] = di[:15]
+        elif m := _RE_DATE.search(excerpt): f["data"] = m.group(0)
+
+    # ── CONTRACT NUMBER ──
+    m = re.search(r"(?:Contrato|Termo|Convênio)\s*(?:n[º°.]*\s*)?" 
+                  r"([\w/\-\.]+\d[\w/\-\.]*)", text, re.I)
+    if m: f["contrato"] = m.group(0)[:50]
+
+    # ── MODALIDADE ──
+    mi = inline.get("modalidade")
+    if mi: f["modalidade"] = mi[:50]
+
+    # ── SERVIDOR + RG (personnel/disciplinary acts) ──
+    # Pattern: "servidor NOME - RG. n.º XX.XXX.XXX-X"  or "ex-servidor NOME, RG XX"
+    ms = re.search(
+        r"(?:ao\s+)?(?:ex-)?servidor[ae]?\s+"
+        r"([A-Z\u00C0-\u00FF][A-Z\u00C0-\u00FFa-z\u00E0-\u00FF\s]{5,60}?)"
+        r"\s*[-–,]\s*RG\.?\s*[Nn]?\.?[º°]?\s*([\d.xX\-]{5,25})",
+        text, re.U)
+    if ms: f["servidor"] = ms.group(1).strip(); f["rg"] = ms.group(2).strip()
+
+    # ── INTERESSADO (DOESP-specific) ──
+    intr = inline.get("interessado")
+    if intr and not f.get("servidor"):
+        f["interessado"] = intr[:80]
+
+    # ── ASSUNTO (DOESP-specific) ──
+    assunto = inline.get("assunto")
+    if assunto: f["assunto"] = assunto[:100]
+
+    # ── PENALIDADE (DOESP: APLICA a penalidade de...) ──
+    mp = re.search(
+        r"APLIC[AO]\s+a\s+penalidade\s+de\s+"
+        r"(\d+\s*\([^)]+\)\s*DIAS?\s+DE\s+SUSPENS[ÃA]O|DEMISS[ÃA]O|MULTA|ADVERTÊNCIA)",
+        text, re.I)
+    if mp: f["penalidade"] = mp.group(1).strip()
+
+    # ── FUNDAMENTO LEGAL ──
+    fl = inline.get("fundamento legal")
+    if fl:
+        # Stop at first verb/action (NOMEIA, RESOLVE, DETERMINA)
+        cut = re.search(r"\b(NOMEIA|RESOLVE|DETERMINA|AUTORIZA|DESIGNA|DESPACHO)\b", fl, re.I)
+        f["fundamento"] = fl[:cut.start()].strip().rstrip(".,; ") if cut else fl[:80]
+
+    return {k: v for k, v in f.items() if v}
+
+
+# ── TREE PARSER ───────────────────────────────────────────────────
 def extract_publications_from_tree(tree_data):
-    """
-    Recursively walk the tree structure API response.
-    Returns list of {title, slug, id, path} for every publication.
-    The path is the hierarchical chain: CASA CIVIL > Gabinete > Subsecretaria
-    """
     pubs = []
     def walk(node, path_parts):
         if isinstance(node, dict):
             name = node.get("name","")
             new_path = path_parts + [name] if name else path_parts
             for pub in node.get("publications",[]):
-                pubs.append({
-                    "title": pub.get("title",""),
-                    "slug":  pub.get("slug",""),
-                    "id":    pub.get("id",""),
-                    "path":  " > ".join(new_path),
-                    "org":   new_path[-1] if len(new_path)>=2 else name,
-                    "dept":  new_path[-1] if len(new_path)>=3 else "",
-                })
+                pubs.append({"title":pub.get("title",""),"slug":pub.get("slug",""),
+                    "id":pub.get("id",""),"path":" > ".join(new_path),
+                    "org":new_path[-1] if len(new_path)>=2 else name})
             for key in ("children","items","itens","categories"):
-                for child in node.get(key,[]):
-                    walk(child, new_path)
+                for child in node.get(key,[]): walk(child, new_path)
         elif isinstance(node, list):
             for item in node: walk(item, path_parts)
     walk(tree_data, [])
     return pubs
 
-# ===========================================================================
-# PLAYWRIGHT: navigate, click, intercept APIs
-# ===========================================================================
+# ── PLAYWRIGHT ────────────────────────────────────────────────────
 def process_caderno(browser, caderno):
-    """
-    Click through caderno → section. Intercept all API responses.
-    Parse tree structure for ALL publications.
-    Returns (publications_list, pdf_uuid, dom_text, excerpts_dict).
-    """
-    jn  = caderno["journalName"]
-    rsn = caderno["rootSectionName"]
-    lbl = caderno["label"]
-
-    tree_data     = None
-    pub_excerpts  = {}     # pub_id → excerpt
-    pdf_uuid      = None
-    all_api       = []
+    jn=caderno["journalName"]; rsn=caderno["rootSectionName"]; lbl=caderno["label"]
+    tree_data=None; pub_excerpts={}; pdf_uuid=None; all_api=[]
 
     def on_response(response):
         nonlocal tree_data, pdf_uuid
         try:
             url=response.url; ct=response.headers.get("content-type","")
             if response.status==200 and "json" in ct:
-                data=response.json()
-                all_api.append({"url":url,"data":data})
-                raw=json.dumps(data,ensure_ascii=False)
-
-                # Detect tree structure (has journalName + items with children/publications)
+                data=response.json(); all_api.append({"url":url,"data":data})
                 if isinstance(data,dict) and "journalName" in data and "items" in data:
-                    tree_data=data
-                    print(f"    TREE [{url[-55:]}]")
-
-                # Detect publications list (has "publications" array with excerpts)
+                    tree_data=data; print(f"    TREE [{url[-55:]}]")
                 if isinstance(data,dict) and "publications" in data and "pages" in data:
                     for p in data["publications"]:
                         if p.get("id") and p.get("excerpt"):
                             pub_excerpts[p["id"]]=p.get("excerpt","")[:500]
-                    print(f"    PUBS [{url[-55:]}] {data.get('pages',0)} pages, {len(data.get('publications',[]))} on p1")
-
-                # Detect PDF edition URL
+                    print(f"    PUBS [{url[-55:]}] {data.get('pages',0)} pages")
                 if isinstance(data,dict) and "fileName" in data and "url" in data:
-                    pdf_uuid=data["fileName"]
-                    print(f"    PDF UUID: {pdf_uuid}")
-
-                # Detect edition status (backup for PDF UUID)
-                if isinstance(data,dict) and "editionsProcessed" in data:
-                    print(f"    EDITIONS STATUS: {len(data['editionsProcessed'])} editions")
+                    pdf_uuid=data["fileName"]; print(f"    PDF UUID: {pdf_uuid}")
         except: pass
 
     ctx=browser.new_context(
-        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         locale="pt-BR")
-    page=ctx.new_page()
-    page.on("response", on_response)
+    page=ctx.new_page(); page.on("response", on_response)
 
     try:
-        # Step 1: load
-        print(f"  [{lbl}] Loading sumário...")
+        print(f"  [{lbl}] Loading...")
         page.goto(PORTAL_URL, wait_until="networkidle", timeout=30000)
         page.wait_for_timeout(3000)
 
-        # Step 2: click caderno
-        print(f"  [{lbl}] Click caderno '{jn}'")
+        print(f"  [{lbl}] Click '{jn}'")
         for sel in [f"text='{jn}'",f"button:has-text('{jn}')",f"a:has-text('{jn}')"]:
             loc=page.locator(sel)
-            if loc.count()>0: loc.first.click(); print(f"    ✅ {sel}"); break
+            if loc.count()>0: loc.first.click(); break
         page.wait_for_timeout(4000)
 
-        # Step 3: click section
-        print(f"  [{lbl}] Click section '{rsn}'")
+        print(f"  [{lbl}] Click '{rsn}'")
         clicked=False
         for sel in [f"text='{rsn}'",f"a:has-text('{rsn}')",f"span:has-text('{rsn}')"]:
             loc=page.locator(sel)
-            if loc.count()>0: loc.first.click(); clicked=True; print(f"    ✅ {sel}"); break
+            if loc.count()>0: loc.first.click(); clicked=True; break
         if not clicked:
             words=rsn.split()
             for el in page.query_selector_all("a, button, div, span, li"):
                 txt=(el.inner_text() or "").strip()
                 if all(w.lower() in txt.lower() for w in words) and len(txt)<80:
-                    el.click(); clicked=True; print(f"    ✅ '{txt[:40]}'"); break
+                    el.click(); clicked=True; break
         page.wait_for_timeout(6000)
 
-        # Read DOM text
         dom_text=page.inner_text("body")
-        print(f"  [{lbl}] DOM: {len(dom_text):,} chars | tree={'✅' if tree_data else '❌'} | pdf={pdf_uuid or '❌'} | excerpts={len(pub_excerpts)}")
-
+        print(f"  [{lbl}] DOM={len(dom_text):,}ch tree={'✅' if tree_data else '❌'} pubs={len(pub_excerpts)} pdf={pdf_uuid or '❌'}")
         ctx.close()
-        return tree_data, pub_excerpts, pdf_uuid, dom_text, all_api
-
+        return tree_data, pub_excerpts, pdf_uuid, dom_text
     except Exception as e:
-        print(f"  [{lbl}] PW error: {e}")
-        import traceback; traceback.print_exc()
-        ctx.close()
-        return None, {}, None, "", []
+        print(f"  [{lbl}] PW error: {e}"); ctx.close()
+        return None, {}, None, ""
 
-# ===========================================================================
-# SCAN — keyword search over all publications from tree
-# ===========================================================================
+# ── SCAN ──────────────────────────────────────────────────────────
 def scan_publications(pubs, excerpts, dom_text, caderno):
-    """
-    Scan all publication titles (from tree API) + excerpts + DOM text for keywords.
-    Returns scored hit list.
-    """
     lbl=caderno["label"]; jn=caderno["journalName"]; rsn=caderno["rootSectionName"]
-    results=[]; seen=set(); kw_cnt={}
-    dom_low=normalize(dom_text)
+    results=[]; seen=set(); kw_cnt={}; dom_low=normalize(dom_text)
 
     for kw in KEYWORDS:
         kn=normalize(kw); cat=KEYWORD_CATEGORIES.get(kw,"general")
-        rules=KEYWORD_FILTERS.get(kw,{})
-        mh=rules.get("max_hits",999); cnt=0
+        rules=KEYWORD_FILTERS.get(kw,{}); mh=rules.get("max_hits",999); cnt=0
 
         for pub in pubs:
             title_low=normalize(pub["title"])
-            excerpt_low=normalize(excerpts.get(pub["id"],""))
-            searchable=title_low+" "+excerpt_low
+            exc_text=excerpts.get(pub["id"],"")
+            exc_low=normalize(exc_text)
+            searchable=title_low+" "+exc_low
 
-            if kn not in searchable and kn not in dom_low: continue
-            if kn in searchable:
-                # Found in this specific publication
-                dedup=(kw,pub["id"])
-                if dedup in seen: continue
-                seen.add(dedup)
-                if cnt>=mh: continue
+            if kn not in searchable: continue
+            dedup=(kw,pub["id"])
+            if dedup in seen: continue
+            seen.add(dedup)
+            if cnt>=mh: continue
 
-                full_text=pub["title"]+" "+(excerpts.get(pub["id"],""))
-                full_low=normalize(full_text)
-                if not passes_filter(kw, full_low, full_text): continue
+            full_text=pub["title"]+" "+exc_text
+            full_low=normalize(full_text)
+            if not passes_filter(kw, full_low, full_text): continue
 
-                v,sc,ft=tv_score(full_low, kw, full_text)
-                results.append({
-                    "keyword":kw,"veredito":v,"score":sc,"fatores":ft,
-                    "ref":{
-                        "keyword":kw,"label":lbl,
-                        "journal":jn,"section":rsn,
-                        "title":pub["title"][:150],
-                        "path":pub["path"],
-                        "org":pub.get("org",""),
-                        "slug":pub.get("slug",""),
-                        "excerpt":(excerpts.get(pub["id"],""))[:400],
-                        "pub_id":pub["id"],
-                    }
-                })
-                cnt+=1; kw_cnt[kw]=cnt
+            fields=extract_fields(pub["title"], exc_text, pub["path"])
+            v,sc,ft=tv_score(full_low, kw, full_text, fields)
+            results.append({
+                "keyword":kw,"veredito":v,"score":sc,"fatores":ft,"fields":fields,
+                "ref":{"keyword":kw,"label":lbl,"journal":jn,"section":rsn,
+                       "title":pub["title"][:150],"path":pub["path"],
+                       "org":pub.get("org",""),"slug":pub.get("slug",""),"pub_id":pub["id"]}
+            })
+            cnt+=1; kw_cnt[kw]=cnt
 
     for kw,n in sorted(kw_cnt.items(),key=lambda x:-x[1]):
         print(f"    '{kw}': {n}")
     ap=sum(1 for r in results if r["veredito"].startswith("🟢"))
     pr=sum(1 for r in results if r["veredito"].startswith("🟡"))
-    total_pubs=len(pubs)
-    print(f"  [{lbl}] {total_pubs} publicações escaneadas → {len(results)} hits | 🟢{ap} 🟡{pr}")
+    print(f"  [{lbl}] {len(pubs)} pubs → {len(results)} hits | 🟢{ap} 🟡{pr}")
     return results
 
 def passes_filter(kw, text_low, text_raw):
@@ -343,139 +420,129 @@ def passes_filter(kw, text_low, text_raw):
         if m and 0<parse_brl(m.group(0))<mv: return False
     return True
 
-# ===========================================================================
-# TV SCORING (DOC-SP v9.3 + state-level bonuses)
-# ===========================================================================
-def tv_score(text_low, keyword, text_raw):
+# ── TV SCORING ────────────────────────────────────────────────────
+def tv_score(text_low, keyword, text_raw, fields):
     cat=KEYWORD_CATEGORIES.get(keyword,"general")
     tier=CATEGORY_TV.get(cat,(3,"",""))[0]
     score={1:4,2:2,3:0}.get(tier,0); fatores=[]
 
-    m=_RE_MONEY.search(text_raw)
-    if m:
-        amt=parse_brl(m.group(0))
+    val=fields.get("valor","")
+    if val:
+        amt=parse_brl(val)
         if amt>=50_000_000: score+=5; fatores.append(f"R${amt/1e6:.0f}M")
         elif amt>=10_000_000: score+=4; fatores.append(f"R${amt/1e6:.0f}M")
         elif amt>=1_000_000: score+=3; fatores.append(f"R${amt/1e6:.1f}M")
         elif amt>=100_000: score+=1; fatores.append(f"R${amt/1e3:.0f}k")
 
-    if any(t in text_low for t in ["emergencial","urgente","urgência"]):
-        score+=3; fatores.append("EMERGENCIAL")
-    if any(t in text_low for t in ["superfaturamento","sobrepreço","fraude em licitação","improbidade"]):
-        score+=4; fatores.append("SUSPEITO")
-    if any(t in text_low for t in ["hospital das clínicas","leito de uti","organização social de saúde","pronto-socorro"]):
-        score+=2; fatores.append("SAÚDE")
-    if any(t in text_low for t in ["escola estadual","merenda","alimentação escolar"]):
-        score+=2; fatores.append("EDUCAÇÃO")
-    if any(t in text_low for t in ["unidade prisional","policial penal","penitenciária","complexo penal"]):
-        score+=1; fatores.append("PENITENCIÁRIO")
-    if any(t in text_low for t in ["demissão","suspensão por","aposentadoria compulsória"]):
-        score+=2; fatores.append("SANÇÃO FUNCIONAL")
-    if any(t in text_low for t in ["concessão rodoviária","sabesp","metrô","cptm","dersa"]):
-        score+=1; fatores.append("INFRAESTRUTURA")
-    if any(t in text_low for t in ["cetesb","contaminada","embargo ambiental","área de risco"]):
-        score+=1; fatores.append("MEIO AMBIENTE")
-    # Field bonuses
-    if _RE_CNPJ.search(text_raw): score+=1; fatores.append("CNPJ")
-    if _RE_SEI.search(text_raw): score+=1; fatores.append("SEI")
+    if any(t in text_low for t in ["emergencial","urgente"]): score+=3; fatores.append("EMERGENCIAL")
+    if any(t in text_low for t in ["superfaturamento","sobrepreço","fraude","improbidade"]): score+=4; fatores.append("SUSPEITO")
+    if any(t in text_low for t in ["hospital das clínicas","leito de uti","organização social de saúde"]): score+=2; fatores.append("SAÚDE")
+    if any(t in text_low for t in ["escola estadual","merenda","alimentação escolar"]): score+=2; fatores.append("EDUCAÇÃO")
+    if any(t in text_low for t in ["unidade prisional","policial penal","penitenciária"]): score+=1; fatores.append("PENITENCIÁRIO")
+    if any(t in text_low for t in ["demissão","suspensão por","aposentadoria compulsória"]): score+=2; fatores.append("SANÇÃO")
+    if any(t in text_low for t in ["sabesp","metrô","cptm","dersa"]): score+=1; fatores.append("INFRAESTRUTURA")
+    if any(t in text_low for t in ["cetesb","contaminada","embargo"]): score+=1; fatores.append("AMBIENTAL")
+
+    if fields.get("empresa") or fields.get("servidor"): score+=1; fatores.append("IDENTIFICADO")
+    if fields.get("cnpj"): score+=1; fatores.append("CNPJ")
+    if fields.get("processo") or fields.get("sei"): score+=1; fatores.append("SEI")
 
     if score>=8: v="🟢 APROVADA"
     elif score>=5: v="🟡 PODE RENDER"
     else: v="🔴 BACKGROUND"
     return v,score,fatores
 
-# ===========================================================================
-# FICHA — structured card with clear hierarchy
-# ===========================================================================
+# ── FICHA — clean structured card, NO raw excerpt ────────────────
 def build_ficha(hit, date_str):
-    ref=hit["ref"]; kw=ref["keyword"]
+    ref=hit["ref"]; f=hit.get("fields",{}); kw=ref["keyword"]
     cat=KEYWORD_CATEGORIES.get(kw,"general")
     _,icon,cat_nome=CATEGORY_TV.get(cat,(3,"🔍","Geral"))
     lbl=ref.get("label",""); jn=ref.get("journal",""); rsn=ref.get("section","")
     emo=next((c["emoji"] for c in CADERNOS if c["label"]==lbl),"📋")
-    fstr=" · ".join(hit["fatores"]) if hit["fatores"] else "—"
     link=caderno_url(jn,rsn)
-    path=ref.get("path","")
-    excerpt=ref.get("excerpt","")
-
-    # Extract fields from excerpt
-    valor=None; cnpj=None; sei=None; empresa=None
-    if excerpt:
-        m=_RE_MONEY.search(excerpt)
-        if m: valor=m.group(0)
-        m=_RE_CNPJ.search(excerpt)
-        if m: cnpj=m.group(0)
-        m=_RE_SEI.search(excerpt)
-        if m: sei=m.group(0)
-        m=re.search(r'(?:Contratad[ao]|empresa)\s*:?\s*([A-Z][A-Za-záéíóúÀ-ÿ\s&.,/()-]{5,80}?(?:LTDA|S/?A|EIRELI|EPP|ME)\b)',excerpt,re.I)
-        if m: empresa=m.group(1).strip()
 
     lines=[
         f"📋 *DOESP {date_str}*",
         f"{emo} *{jn}* › *{rsn}*",
-        f"{hit['veredito']} | {icon} *{cat_nome}*",
-        f"🔑 `{kw}` | Score {hit['score']} | {fstr}",
+        f"{hit['veredito']} | {icon} *{cat_nome}* | Score {hit['score']}",
+        f"🔑 `{kw}`",
         "─"*22,
     ]
-    # Hierarchy path (CASA CIVIL > Gabinete > Subsecretaria)
-    if path:
-        # Remove section name from path (already shown above)
-        short_path=path.split(" > ",1)[1] if " > " in path else path
-        if short_path: lines.append(f"🏛️ {short_path}")
-    if ref.get("title"): lines.append(f"📄 *{ref['title'][:130]}*")
-    # Extracted fields
-    if empresa: lines.append(f"🏢 {empresa[:80]}")
-    if cnpj: lines.append(f"   CNPJ: {cnpj}")
-    if valor: lines.append(f"💰 {valor}")
-    if sei: lines.append(f"🔖 SEI: {sei}")
-    # Excerpt (if available)
-    if excerpt:
-        hi=re.sub(f"(?i)({re.escape(kw)})",r"*\1*",excerpt[:250])
-        lines.append(f"💬 _{hi}_")
-    # Lacunas (what's missing)
-    lacunas=[]
-    if not empresa and cat in ("contrato","licitacao","penalidade","urgencia"):
-        lacunas.append("Empresa/contratada")
-    if not cnpj and cat in ("contrato","licitacao","penalidade"):
-        lacunas.append("CNPJ")
-    if not valor and cat not in ("pessoal","disciplinar","educacao"):
-        lacunas.append("Valor")
-    if lacunas: lines.append(f"❓ Faltando: {' · '.join(lacunas)}")
-    lines+=["─"*22,f"🔗 [Abrir no portal]({link})"]
+    # WHERE — government branch
+    if f.get("orgao"):        lines.append(f"🏛️ *{f['orgao'][:70]}*")
+    # WHAT — act type + title + assunto + object
+    tipo = f.get("tipo_ato","")
+    if tipo and ref.get("title"):
+        lines.append(f"📄 {ref['title'][:130]}")
+    elif ref.get("title"):
+        lines.append(f"📄 {ref['title'][:130]}")
+    if f.get("assunto"):      lines.append(f"📌 {f['assunto'][:100]}")
+    if f.get("objeto"):       lines.append(f"📦 {f['objeto'][:150]}")
+    if f.get("modalidade"):   lines.append(f"📋 {f['modalidade']}")
+    if f.get("penalidade"):   lines.append(f"⚖️ Pena: *{f['penalidade']}*")
+    # WHO — company, servidor, or interessado
+    if f.get("empresa"):      lines.append(f"🏢 *{f['empresa'][:80]}*")
+    if f.get("cnpj"):         lines.append(f"   CNPJ: {f['cnpj']}")
+    if f.get("servidor"):     lines.append(f"👤 *{f['servidor']}*")
+    if f.get("rg"):           lines.append(f"   RG: {f['rg']}")
+    if f.get("interessado") and not f.get("servidor"):
+        lines.append(f"👤 {f['interessado'][:60]}")
+    # HOW MUCH / WHEN
+    if f.get("valor"):        lines.append(f"💰 *{f['valor']}*")
+    if f.get("prazo"):        lines.append(f"⏱️ {f['prazo']}")
+    if f.get("data"):         lines.append(f"📅 {f['data']}")
+    if f.get("contrato"):     lines.append(f"📄 {f['contrato']}")
+    if f.get("processo") or f.get("sei"):
+        lines.append(f"🔖 {f.get('processo') or f.get('sei')}")
+    if f.get("fundamento"):   lines.append(f"⚖️ {f['fundamento'][:60]}")
+    # MISSING
+    missing=[]
+    if not f.get("empresa") and not f.get("servidor") and not f.get("interessado"):
+        if cat in ("contrato","licitacao","penalidade","urgencia"):
+            missing.append("Empresa")
+        elif cat in ("disciplinar",):
+            missing.append("Servidor")
+    if not f.get("cnpj") and cat in ("contrato","licitacao","penalidade"):
+        missing.append("CNPJ")
+    if not f.get("valor") and cat not in ("pessoal","disciplinar","educacao","seguranca"):
+        missing.append("Valor")
+    if not f.get("processo") and not f.get("sei"):
+        missing.append("Processo")
+    if missing: lines.append(f"❓ *Faltando:* {' · '.join(missing)}")
+    lines+=["─"*22,f"🔗 [Portal]({link})"]
     return "\n".join(lines)
+
 
 def build_summary(results_by_caderno, date_str, pub_counts):
     all_h=[h for v in results_by_caderno.values() for h in v]
     total=len(all_h)
     ap=sum(1 for h in all_h if h["veredito"].startswith("🟢"))
     pr=sum(1 for h in all_h if h["veredito"].startswith("🟡"))
-    lines=[
-        f"📋 *{SOURCE_NAME} — {date_str}*",
-        f"📊 *{total} resultado(s)*",
-        f"🟢 {ap}  🟡 {pr}  🔴 {total-ap-pr}\n",
-    ]
+    lines=[f"📋 *DOESP — {date_str}*",
+           f"📊 *{total} resultado(s)* | 🟢 {ap}  🟡 {pr}  🔴 {total-ap-pr}\n"]
     for c in CADERNOS:
         lbl=c["label"]; hits=results_by_caderno.get(lbl,[])
         n_pubs=pub_counts.get(lbl,0)
         a=sum(1 for h in hits if h["veredito"].startswith("🟢"))
         p=sum(1 for h in hits if h["veredito"].startswith("🟡"))
-        if hits:
-            lines.append(f"{c['emoji']} *{lbl}* ({n_pubs} pub): {len(hits)} hits | 🟢{a} 🟡{p}")
-        else:
-            lines.append(f"{c['emoji']} *{lbl}* ({n_pubs} pub): —")
+        lines.append(f"{c['emoji']} *{lbl}* ({n_pubs} pub): {len(hits)} hits | 🟢{a} 🟡{p}" if hits
+                     else f"{c['emoji']} *{lbl}* ({n_pubs} pub): —")
     lines.append("━"*20)
     for h in sorted(all_h,key=lambda x:-x["score"])[:12]:
-        cat=KEYWORD_CATEGORIES.get(h["ref"]["keyword"],"general")
-        _,icon,_=CATEGORY_TV.get(cat,(3,"🔍",""))
-        ref=h["ref"]
-        org=(ref.get("org") or "")[:25]
-        lines.append(f"{h['veredito'][:2]} {icon} `{ref['keyword'][:28]}` [{ref['label']}] {org}")
+        _,icon,_=CATEGORY_TV.get(KEYWORD_CATEGORIES.get(h["ref"]["keyword"],"general"),(3,"🔍",""))
+        ref=h["ref"]; f=h.get("fields",{})
+        emp=(f.get("empresa") or f.get("servidor") or "")[:25]
+        val=f.get("valor","")[:15]
+        org=(ref.get("org") or "")[:20]
+        l=f"{h['veredito'][:2]} {icon} `{ref['keyword'][:25]}` [{ref['label']}]"
+        if org: l+=f" {org}"
+        if emp: l+=f" | {emp}"
+        if val: l+=f" | {val}"
+        lines.append(l)
     lines+=["━"*20,f"🔗 [Portal]({PORTAL_URL})"]
     return "\n".join(lines)
 
-# ===========================================================================
-# TELEGRAM
-# ===========================================================================
+# ── TELEGRAM ──────────────────────────────────────────────────────
 _last_send=0.0
 def send_telegram(text, silent=False):
     global _last_send
@@ -502,68 +569,45 @@ def split_long(text, mx=3800):
     if cur: parts.append(cur)
     return parts
 
-# ===========================================================================
-# MAIN
-# ===========================================================================
+# ── MAIN ──────────────────────────────────────────────────────────
 def main():
-    hoje=datetime.date.today()
-    date_str=hoje.strftime("%d/%m/%Y")
-    print(f"=== {SOURCE_NAME} Monitor v5.3 — {date_str} ===\n")
-
+    hoje=datetime.date.today(); date_str=hoje.strftime("%d/%m/%Y")
+    print(f"=== DOESP Monitor v5.3 — {date_str} ===\n")
     from playwright.sync_api import sync_playwright
     print("  Playwright: ✅\n")
 
-    results_by_caderno={}
-    pub_counts={}
+    results_by_caderno={}; pub_counts={}
 
     with sync_playwright() as pw:
-        browser=pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox","--disable-setuid-sandbox",
-                  "--disable-dev-shm-usage","--disable-gpu"])
+        browser=pw.chromium.launch(headless=True,
+            args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu"])
 
         for caderno in CADERNOS:
             lbl,emo=caderno["label"],caderno["emoji"]
-            print(f"\n{'─'*60}")
-            print(f"{emo}  {caderno['journalName']} / {caderno['rootSectionName']}")
-            print(f"{'─'*60}")
+            print(f"\n{'─'*60}\n{emo}  {caderno['journalName']} / {caderno['rootSectionName']}\n{'─'*60}")
 
-            tree_data, excerpts, pdf_uuid, dom_text, api_data = \
-                process_caderno(browser, caderno)
-
+            tree_data, excerpts, pdf_uuid, dom_text = process_caderno(browser, caderno)
             hits=[]
 
-            # Strategy A: parse tree structure (ALL publications)
             if tree_data:
                 pubs=extract_publications_from_tree(tree_data)
                 pub_counts[lbl]=len(pubs)
-                print(f"  [{lbl}] Tree: {len(pubs)} publicações extraídas")
-                if pubs:
-                    hits=scan_publications(pubs, excerpts, dom_text, caderno)
+                print(f"  [{lbl}] {len(pubs)} publicações na árvore")
+                if pubs: hits=scan_publications(pubs, excerpts, dom_text, caderno)
 
-            # Strategy B: if no tree, scan DOM text
             if not hits and len(dom_text)>2000:
-                print(f"  [{lbl}] Fallback: scanning DOM text...")
+                print(f"  [{lbl}] Fallback: DOM text")
                 fn=normalize(dom_text)
                 for kw in KEYWORDS:
-                    kn=normalize(kw)
-                    if kn in fn:
-                        v,sc,ft=tv_score(fn,kw,dom_text)
-                        hits.append({"keyword":kw,"veredito":v,"score":sc,"fatores":ft,
-                            "ref":{"keyword":kw,"label":lbl,
-                                   "journal":caderno["journalName"],
-                                   "section":caderno["rootSectionName"],
-                                   "title":"","path":"","org":"",
-                                   "excerpt":"","slug":"","pub_id":""}})
+                    if normalize(kw) in fn:
+                        v,sc,ft=tv_score(fn,kw,dom_text,{})
+                        hits.append({"keyword":kw,"veredito":v,"score":sc,"fatores":ft,"fields":{},
+                            "ref":{"keyword":kw,"label":lbl,"journal":caderno["journalName"],
+                                   "section":caderno["rootSectionName"],"title":"","path":"","org":"","slug":"","pub_id":""}})
                 pub_counts.setdefault(lbl,0)
 
             if not hits:
-                msg=(f"⚠️ *DOESP {date_str}* — {emo} [{lbl}]\n"
-                     f"Sem resultados relevantes\n"
-                     f"🔗 [Verificar]({caderno_url(caderno['journalName'],caderno['rootSectionName'])})")
-                print(f"  [{lbl}] ⚠️ Nenhum resultado")
-                send_telegram(msg)
-
+                send_telegram(f"⚠️ *DOESP {date_str}* — {emo} [{lbl}]\nSem resultados\n🔗 [Verificar]({caderno_url(caderno['journalName'],caderno['rootSectionName'])})")
             results_by_caderno[lbl]=hits
             time.sleep(2)
 
@@ -572,7 +616,6 @@ def main():
     total=sum(len(v) for v in results_by_caderno.values())
     all_hits=[h for v in results_by_caderno.values() for h in v]
     print(f"\n{'='*60}\nTOTAL: {total}")
-
     if total==0: return
 
     send_telegram(build_summary(results_by_caderno, date_str, pub_counts))
@@ -583,17 +626,22 @@ def main():
     background =       [h for h in all_hits if h["veredito"].startswith("🔴")]
 
     for h in aprovadas+pode_render:
-        card=build_ficha(h, date_str)
-        for part in split_long(card): send_telegram(part)
+        for part in split_long(build_ficha(h, date_str)): send_telegram(part)
         time.sleep(0.5)
 
     if background:
         lines=[f"🗂️ *Background — {date_str}* — {len(background)} ref(s)"]
         for h in background[:25]:
-            cat=KEYWORD_CATEGORIES.get(h["keyword"],"general")
-            _,icon,_=CATEGORY_TV.get(cat,(3,"🔍",""))
-            ref=h["ref"]; org=(ref.get("org") or "")[:30]
-            lines.append(f"{icon} `{h['keyword'][:28]}` [{ref['label']}] {org}")
+            _,icon,_=CATEGORY_TV.get(KEYWORD_CATEGORIES.get(h["keyword"],"general"),(3,"🔍",""))
+            ref=h["ref"]; f=h.get("fields",{})
+            emp=f.get("empresa","") or f.get("servidor","")
+            val=f.get("valor","")
+            org=(ref.get("org") or "")[:25]
+            l=f"{icon} `{h['keyword'][:25]}` [{ref['label']}]"
+            if org: l+=f" {org}"
+            if emp: l+=f" | {emp[:30]}"
+            if val: l+=f" | {val[:20]}"
+            lines.append(l)
         send_telegram("\n".join(lines), silent=True)
 
 if __name__=="__main__":
