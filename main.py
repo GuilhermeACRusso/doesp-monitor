@@ -20,63 +20,150 @@ UUID_RE    = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 
 # ── KEYWORDS ──────────────────────────────────────────────────────
 KEYWORD_CATEGORIES = {
-    "contratação emergencial":"urgencia","organização social de saúde":"saude",
-    "contrato de gestão":"saude","hospital das clínicas":"saude",
-    "leito de UTI":"saude","medicamento de alto custo":"saude",
-    "improbidade administrativa":"investigativo","superfaturamento":"investigativo",
-    "sobrepreço":"investigativo","fraude em licitação":"investigativo",
-    "desvio de verba":"investigativo","lavagem de dinheiro":"investigativo",
-    "dispensa de licitação":"licitacao","inexigibilidade de licitação":"licitacao",
-    "licitação deserta":"licitacao","concorrência eletrônica":"licitacao",
-    "extrato de contrato":"contrato","rescisão de contrato":"contrato",
-    "termo de aditamento":"contrato","rescindido o contrato":"contrato",
-    "obra paralisada":"obras","habitação de interesse social":"obras",
-    "unidades habitacionais":"obras","saneamento básico":"obras",
-    "pavimentação":"obras","recapeamento asfáltico":"obras",
-    "canalização":"obras","concessão rodoviária":"obras",
-    "demissão de servidor":"disciplinar","aposentadoria compulsória":"disciplinar",
-    "processo administrativo disciplinar":"disciplinar","sindicância":"disciplinar",
-    "aplicação de penalidade":"penalidade","multa contratual":"penalidade",
-    "ação civil pública":"legal","merenda escolar":"educacao",
-    "transporte escolar":"educacao","construção de escola estadual":"educacao",
-    "fechamento de escola":"educacao","concurso de professor":"educacao",
-    "dengue":"saude","operação policial":"seguranca",
-    "unidade prisional":"seguranca","morte em custódia":"seguranca",
-    "feminicídio":"seguranca","delegacia de polícia":"seguranca",
-    "licença ambiental":"meio_ambiente","auto de infração ambiental":"meio_ambiente",
-    "CETESB":"meio_ambiente","área contaminada":"meio_ambiente",
-    "crédito adicional suplementar":"orcamento",
-    "nomeação para cargo em comissão":"pessoal",
-    "exoneração a pedido":"pessoal","exoneração de servidor":"pessoal",
+    # ── TIER 1: INVESTIGATIVO / URGÊNCIA ──
+    "contratação emergencial":              "urgencia",
+    "calamidade pública":                   "urgencia",
+    "organização social de saúde":          "saude",
+    "contrato de gestão":                   "saude",
+    "hospital das clínicas":                "saude",
+    "leito de UTI":                         "saude",
+    "medicamento de alto custo":            "saude",
+    "improbidade administrativa":           "investigativo",
+    "superfaturamento":                     "investigativo",
+    "sobrepreço":                           "investigativo",
+    "fraude em licitação":                  "investigativo",
+    "desvio de verba":                      "investigativo",
+    "lavagem de dinheiro":                  "investigativo",
+    "apuração de irregularidade":           "investigativo",
+    "inquérito civil":                      "investigativo",
+    # ── TIER 2: PRIVATIZAÇÃO / CONCESSÃO (Tarcísio signature policy) ──
+    "privatização":                         "privatizacao",
+    "desestatização":                       "privatizacao",
+    "concessão de serviço público":         "privatizacao",
+    "parceria público-privada":             "privatizacao",
+    "reequilíbrio econômico":               "privatizacao",
+    "reajuste de tarifa":                   "privatizacao",
+    # ── TIER 2: FISCAL ──
+    "renúncia fiscal":                      "fiscal",
+    "benefício fiscal":                     "fiscal",
+    "isenção de ICMS":                      "fiscal",
+    "crédito adicional suplementar":        "orcamento",
+    # ── TIER 2: LICITAÇÃO / CONTRATO ──
+    "dispensa de licitação":                "licitacao",
+    "inexigibilidade de licitação":         "licitacao",
+    "licitação deserta":                    "licitacao",
+    "concorrência eletrônica":              "licitacao",
+    "pregão eletrônico":                    "licitacao",
+    "extrato de contrato":                  "contrato",
+    "rescisão de contrato":                 "contrato",
+    "termo de aditamento":                  "contrato",
+    "rescindido o contrato":                "contrato",
+    # ── TIER 2: OBRAS / INFRAESTRUTURA ──
+    "obra paralisada":                      "obras",
+    "habitação de interesse social":        "obras",
+    "unidades habitacionais":               "obras",
+    "programa habitacional":                "obras",
+    "saneamento básico":                    "obras",
+    "pavimentação":                         "obras",
+    "recapeamento asfáltico":               "obras",
+    "canalização":                          "obras",
+    "concessão rodoviária":                 "obras",
+    "desapropriação":                       "obras",
+    "trem intercidades":                    "obras",
+    "pedágio":                              "obras",
+    "túnel Santos":                         "obras",
+    # ── TIER 2: DISCIPLINAR / PENALIDADE ──
+    "demissão de servidor":                 "disciplinar",
+    "aposentadoria compulsória":            "disciplinar",
+    "processo administrativo disciplinar":  "disciplinar",
+    "sindicância":                          "disciplinar",
+    "aplicação de penalidade":              "penalidade",
+    "multa contratual":                     "penalidade",
+    # ── TIER 2: SEGURANÇA ──
+    "operação policial":                    "seguranca",
+    "unidade prisional":                    "seguranca",
+    "morte em custódia":                    "seguranca",
+    "feminicídio":                          "seguranca",
+    "delegacia de polícia":                 "seguranca",
+    "letalidade policial":                  "seguranca",
+    "intervenção policial":                 "seguranca",
+    "câmera corporal":                      "seguranca",
+    # ── TIER 2: LEGAL ──
+    "ação civil pública":                   "legal",
+    "decisão judicial":                     "legal",
+    # ── TIER 2: EDUCAÇÃO ──
+    "merenda escolar":                      "educacao",
+    "transporte escolar":                   "educacao",
+    "construção de escola estadual":        "educacao",
+    "fechamento de escola":                 "educacao",
+    "concurso de professor":                "educacao",
+    # ── TIER 2: SAÚDE ──
+    "dengue":                               "saude",
+    "vigilância sanitária":                 "saude",
+    # ── TIER 2: MEIO AMBIENTE ──
+    "licença ambiental":                    "meio_ambiente",
+    "auto de infração ambiental":           "meio_ambiente",
+    "CETESB":                               "meio_ambiente",
+    "área contaminada":                     "meio_ambiente",
+    # ── TIER 2: ENTIDADES ESTADUAIS ──
+    "CDHU":                                 "obras",
+    "DER":                                  "obras",
+    "ARSESP":                               "privatizacao",
+    # ── TIER 3: PESSOAL ──
+    "nomeação para cargo em comissão":      "pessoal",
+    "exoneração a pedido":                  "pessoal",
+    "exoneração de servidor":               "pessoal",
+    "auditoria":                            "investigativo",
 }
+
 KEYWORDS = sorted(KEYWORD_CATEGORIES.keys(), key=len, reverse=True)
 CATEGORY_TV = {
-    "urgencia":(1,"🚨","Emergência"),"saude":(1,"🏥","Saúde"),
-    "investigativo":(1,"🔎","Investigativo"),"obras":(2,"🏗️","Obras"),
-    "licitacao":(2,"🛒","Licitação"),"contrato":(2,"📝","Contrato"),
-    "disciplinar":(2,"⚖️","Disciplinar"),"penalidade":(2,"⚖️","Penalidade"),
-    "educacao":(2,"🎓","Educação"),"seguranca":(2,"🚔","Segurança"),
-    "legal":(2,"🏛️","Judicial"),"meio_ambiente":(2,"🌿","Meio Ambiente"),
-    "orcamento":(3,"💼","Orçamento"),"pessoal":(3,"👤","Pessoal"),
-    "general":(3,"🔍","Geral"),
+    "urgencia":      (1, "🚨", "Emergência"),
+    "saude":         (1, "🏥", "Saúde"),
+    "investigativo": (1, "🔎", "Investigativo"),
+    "privatizacao":  (1, "🏭", "Privatização"),
+    "fiscal":        (1, "💸", "Fiscal"),
+    "obras":         (2, "🏗️", "Obras"),
+    "licitacao":     (2, "🛒", "Licitação"),
+    "contrato":      (2, "📝", "Contrato"),
+    "disciplinar":   (2, "⚖️", "Disciplinar"),
+    "penalidade":    (2, "⚖️", "Penalidade"),
+    "educacao":      (2, "🎓", "Educação"),
+    "seguranca":     (2, "🚔", "Segurança"),
+    "legal":         (2, "🏛️", "Judicial"),
+    "meio_ambiente": (2, "🌿", "Meio Ambiente"),
+    "orcamento":     (3, "💼", "Orçamento"),
+    "pessoal":       (3, "👤", "Pessoal"),
+    "general":       (3, "🔍", "Geral"),
 }
 KEYWORD_FILTERS = {
     "extrato de contrato":{"max_hits":20,"require_any":["cnpj","contratad","objeto","valor"]},
     "termo de aditamento":{"max_hits":15,"require_any":["cnpj","contratad","valor","aditamento"]},
     "dispensa de licitação":{"max_hits":15,"require_any":["autorizo","homologo","contratad","valor","dispensa"],"skip_if":["resultou fracassada"]},
+    "pregão eletrônico":{"max_hits":15,"require_any":["adjudic","homologo","contratad","valor","vencedora"]},
     "inexigibilidade de licitação":{"min_value":50_000},
     "aplicação de penalidade":{"max_hits":10,"require_any":["aplico","notifico","suspensão","multa","pena"]},
     "sindicância":{"max_hits":10,"require_any":["instaurar","instaurada","conclusão","arquivada","pena","aplico"]},
     "processo administrativo disciplinar":{"max_hits":8,"require_any":["instaurado","instaurada","corregedoria","demissão","suspensão","aplico"]},
     "organização social de saúde":{"require_any":["contrato de gestão","os ","spdm","hospital"]},
-    "CETESB":{"require_any":["multa","embargo","auto de infração","licença"]},
+    "CETESB":{"require_any":["multa","embargo","auto de infração","licença","autuação"]},
+    "DER":{"require_any":["rodovia","concessão","pedágio","obra","licitação"],"skip_if":["der credenciamento"]},
     "dengue":{"require_any":["caso","foco","combate","surto","contrato"],"skip_if":["projeto de lei"]},
     "superfaturamento":{"require_any":["apurou","indício","constatou","investigação","TCE","MP "],"skip_if":["evitar superfaturamento"]},
     "sobrepreço":{"require_any":["apurou","indício","constatou"],"skip_if":["evitar contratações com sobrepreço"]},
+    "privatização":{"require_any":["sabesp","metrô","cptm","concessão","leilão","edital","aprova"]},
+    "renúncia fiscal":{"require_any":["icms","ipva","empresa","benefício","decreto"]},
+    "benefício fiscal":{"require_any":["icms","ipva","empresa","decreto","crédito"]},
+    "pedágio":{"require_any":["concessão","tarifa","rodovia","free flow","lote"]},
+    "desapropriação":{"require_any":["utilidade pública","decreto","imóvel","área","terreno"]},
+    "calamidade pública":{"require_any":["decreto","emergência","defesa civil","situação"]},
+    "reajuste de tarifa":{"require_any":["metrô","cptm","ônibus","água","esgoto","energia"]},
     "nomeação para cargo em comissão":{"max_hits":8},
     "exoneração a pedido":{"max_hits":8},
     "exoneração de servidor":{"max_hits":8},
     "demissão de servidor":{"max_hits":5},
+    "auditoria":{"require_any":["TCE","tribunal de contas","irregularidade","achados","relatório"]},
+    "decisão judicial":{"max_hits":10,"require_any":["determina","condena","anula","suspende","liminar"]},
 }
 
 # ── HELPERS ───────────────────────────────────────────────────────
@@ -440,9 +527,12 @@ def tv_score(text_low, keyword, text_raw, fields):
     if any(t in text_low for t in ["escola estadual","merenda","alimentação escolar"]): score+=2; fatores.append("EDUCAÇÃO")
     if any(t in text_low for t in ["unidade prisional","policial penal","penitenciária"]): score+=1; fatores.append("PENITENCIÁRIO")
     if any(t in text_low for t in ["demissão","suspensão por","aposentadoria compulsória"]): score+=2; fatores.append("SANÇÃO")
-    if any(t in text_low for t in ["sabesp","metrô","cptm","dersa"]): score+=1; fatores.append("INFRAESTRUTURA")
+    if any(t in text_low for t in ["sabesp","metrô","cptm","dersa","trem intercidades"]): score+=2; fatores.append("INFRAESTRUTURA")
     if any(t in text_low for t in ["cetesb","contaminada","embargo"]): score+=1; fatores.append("AMBIENTAL")
-
+    if any(t in text_low for t in ["privatização","desestatização","concessão"]): score+=2; fatores.append("PRIVATIZAÇÃO")
+    if any(t in text_low for t in ["renúncia fiscal","benefício fiscal","isenção de icms"]): score+=3; fatores.append("FISCAL")
+    if any(t in text_low for t in ["letalidade","morte em custódia","feminicídio"]): score+=3; fatores.append("VIOLÊNCIA")
+    if any(t in text_low for t in ["tce","tribunal de contas","auditoria"]): score+=2; fatores.append("TCE")
     if fields.get("empresa") or fields.get("servidor"): score+=1; fatores.append("IDENTIFICADO")
     if fields.get("cnpj"): score+=1; fatores.append("CNPJ")
     if fields.get("processo") or fields.get("sei"): score+=1; fatores.append("SEI")
