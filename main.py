@@ -179,6 +179,78 @@ def parse_brl(s):
 def caderno_url(jn, rsn):
     return f"{PORTAL_URL}?journalName={requests.utils.quote(jn)}&rootSectionName={requests.utils.quote(rsn)}"
 
+# ── ABBREVIATIONS for government terms ──────────────────
+_ABBREVS = [
+    ("SECRETARIA DE ESTADO DA ", "Sec. "),
+    ("SECRETARIA DE ESTADO DE ", "Sec. "),
+    ("SECRETARIA DE ESTADO DO ", "Sec. "),
+    ("SECRETARIA DA ", "Sec. "),
+    ("SECRETARIA DE ", "Sec. "),
+    ("SECRETARIA DO ", "Sec. "),
+    ("COORDENADORIA DE ", "Coord. "),
+    ("COORDENADORIA DA ", "Coord. "),
+    ("SUBSECRETARIA DE ", "Subsec. "),
+    ("SUBSECRETARIA DA ", "Subsec. "),
+    ("SUPERINTENDÊNCIA DE ", "Sup. "),
+    ("SUPERINTENDÊNCIA DA ", "Sup. "),
+    ("DIRETORIA DE ", "Dir. "),
+    ("DIRETORIA DA ", "Dir. "),
+    ("DEPARTAMENTO DE ", "Depto. "),
+    ("DEPARTAMENTO DA ", "Depto. "),
+    ("PREFEITURA MUNICIPAL DE ", "Pref. "),
+    ("PREFEITURA MUNICIPAL DA ", "Pref. "),
+    ("CÂMARA MUNICIPAL DE ", "Câmara "),
+    ("GABINETE DO SECRETÁRIO", "Gab. Secretário"),
+    ("PROCURADORIA GERAL ", "PGE "),
+    ("AGÊNCIA REGULADORA DE SERVIÇOS PÚBLICOS DELEGADOS DE TRANSPORTE DO ESTADO DE SÃO PAULO", "ARTESP"),
+    ("AGÊNCIA REGULADORA DE SERVIÇOS PÚBLICOS DO ESTADO DE SÃO PAULO", "ARSESP"),
+    ("FACULDADE DE MEDICINA DA UNIVERSIDADE DE SÃO PAULO", "FMUSP"),
+    ("FACULDADE DE MEDICINA DE ", "Fac. Med. "),
+    ("HOSPITAL DAS CLÍNICAS DA ", "HC "),
+    ("UNIVERSIDADE DE SÃO PAULO", "USP"),
+    ("UNIVERSIDADE ESTADUAL DE CAMPINAS", "UNICAMP"),
+    ("UNIVERSIDADE ESTADUAL PAULISTA", "UNESP"),
+    ("ADMINISTRAÇÃO PENITENCIÁRIA", "Adm. Penitenciária"),
+    ("SEGURANÇA PÚBLICA", "Seg. Pública"),
+    ("MEIO AMBIENTE, INFRAESTRUTURA E LOGÍSTICA", "Meio Amb./Infra"),
+    ("DESENVOLVIMENTO ECONÔMICO", "Desenv. Econômico"),
+    ("DESENVOLVIMENTO SOCIAL", "Desenv. Social"),
+    ("PARCERIAS EM INVESTIMENTOS", "Parcerias/Invest."),
+]
+
+def abbreviate(text, max_len=70):
+    """Shorten government hierarchy names while keeping them readable."""
+    if not text: return ""
+    t = text
+    for full, short in _ABBREVS:
+        # Case-insensitive replace
+        idx = t.lower().find(full.lower())
+        while idx >= 0:
+            t = t[:idx] + short + t[idx+len(full):]
+            idx = t.lower().find(full.lower(), idx + len(short))
+    # Also handle > separators: trim each segment
+    if " > " in t:
+        parts = t.split(" > ")
+        # Keep first and last parts, abbreviate middle
+        if len(parts) > 3:
+            parts = [parts[0], "...", parts[-1]]
+        t = " > ".join(p.strip() for p in parts)
+    if len(t) > max_len:
+        t = t[:max_len-1] + "…"
+    return t
+
+def extract_city(path, caderno_label):
+    """Extract city name from tree path. For Municípios, it's the first child."""
+    if not path: return ""
+    parts = [p.strip() for p in path.split(" > ")]
+    if caderno_label == "Municípios" and len(parts) >= 2:
+        # First part is section name, second is city
+        city = parts[1] if parts[1] != parts[0] else (parts[2] if len(parts)>2 else "")
+        if city and city.isupper() and len(city) > 2:
+            return city.title()  # VÁRZEA PAULISTA → Várzea Paulista
+    return ""
+
+
 # ── FIELD EXTRACTION REGEXES (ported from DOC-SP v9.3) ───────────
 _RE_MONEY = re.compile(r'R\$\s*[\d.,]+(?:\s*\([^)]{0,80}\))?', re.I)
 _RE_CNPJ  = re.compile(r'(?<!\d)\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}(?!\d)')
@@ -469,7 +541,9 @@ def scan_publications(pubs, excerpts, dom_text, caderno):
             searchable=title_low+" "+exc_low
 
             if kn not in searchable: continue
-            dedup=(kw,pub["id"])
+            # Dedup by keyword + org path (not pub_id) to avoid 8 identical cards
+            org_key = pub.get("path","")[:60]
+            dedup=(kw, org_key)
             if dedup in seen: continue
             seen.add(dedup)
             if cnt>=mh: continue
@@ -550,56 +624,88 @@ def build_ficha(hit, date_str):
     lbl=ref.get("label",""); jn=ref.get("journal",""); rsn=ref.get("section","")
     emo=next((c["emoji"] for c in CADERNOS if c["label"]==lbl),"📋")
     link=caderno_url(jn,rsn)
+    dd_mm = date_str[:5]  # "25/05" from "25/05/2026"
 
-    lines=[
-        f"📋 *DOESP {date_str}*",
-        f"{emo} *{jn}* › *{rsn}*",
-        f"{hit['veredito']} | {icon} *{cat_nome}* | Score {hit['score']}",
-        f"🔑 `{kw}`",
-        "─"*22,
-    ]
-    # WHERE — government branch
-    if f.get("orgao"):        lines.append(f"🏛️ *{f['orgao'][:70]}*")
-    # WHAT — act type + title + assunto + object
-    tipo = f.get("tipo_ato","")
-    if tipo and ref.get("title"):
-        lines.append(f"📄 {ref['title'][:130]}")
-    elif ref.get("title"):
-        lines.append(f"📄 {ref['title'][:130]}")
-    if f.get("assunto"):      lines.append(f"📌 {f['assunto'][:100]}")
-    if f.get("objeto"):       lines.append(f"📦 {f['objeto'][:150]}")
-    if f.get("modalidade"):   lines.append(f"📋 {f['modalidade']}")
-    if f.get("penalidade"):   lines.append(f"⚖️ Pena: *{f['penalidade']}*")
-    # WHO — company, servidor, or interessado
-    if f.get("empresa"):      lines.append(f"🏢 *{f['empresa'][:80]}*")
-    if f.get("cnpj"):         lines.append(f"   CNPJ: {f['cnpj']}")
-    if f.get("servidor"):     lines.append(f"👤 *{f['servidor']}*")
-    if f.get("rg"):           lines.append(f"   RG: {f['rg']}")
-    if f.get("interessado") and not f.get("servidor"):
+    # Extract city for Municípios
+    city = extract_city(ref.get("path",""), lbl)
+
+    # Abbreviate org path
+    org = abbreviate(f.get("orgao",""), max_len=65)
+
+    # Prioritized field assembly — critical fields NEVER truncated
+    lines = []
+
+    # Line 1: date + caderno (compact)
+    cad_short = {"Normativos":"Normat.","Pessoal":"Pessoal","Gestão":"Gestão","Municípios":"Munic."}.get(lbl, lbl)
+    jn_short = {"Executivo":"Exec.","Municípios":"Munic."}.get(jn, jn[:6])
+    header = f"📋 {dd_mm} | {emo} {jn_short} › {cad_short}"
+    if city: header += f" | 📍 {city}"
+    lines.append(header)
+
+    # Line 2: verdict
+    lines.append(f"{hit['veredito']} | {icon} *{cat_nome}* | Score {hit['score']}")
+
+    # Line 3: keyword
+    lines.append(f"🔑 `{kw}`")
+    lines.append("━━━")
+
+    # PRIORITY 1: Government branch (abbreviated, FULL)
+    if org: lines.append(f"🏛️ *{org}*")
+
+    # PRIORITY 2: Title (abbreviated if too long)
+    title = ref.get("title","")
+    if title:
+        if len(title) > 100:
+            title = title[:97] + "…"
+        lines.append(f"📄 {title}")
+
+    # PRIORITY 3: WHO — company/servidor (NEVER truncated)
+    empresa = f.get("empresa","")
+    if empresa:
+        # Clean: don't let processo/SEI leak into empresa
+        empresa = re.split(r'[,;]\s*(?:Processo|SEI|CNPJ|Valor|Objeto)', empresa, flags=re.I)[0].strip()
+        lines.append(f"🏢 *{empresa[:80]}*")
+    if f.get("cnpj"):       lines.append(f"   CNPJ: {f['cnpj']}")
+    if f.get("servidor"):   lines.append(f"👤 *{f['servidor']}*")
+    if f.get("rg"):         lines.append(f"   RG: {f['rg']}")
+    if f.get("interessado") and not f.get("servidor") and not empresa:
         lines.append(f"👤 {f['interessado'][:60]}")
-    # HOW MUCH / WHEN
-    if f.get("valor"):        lines.append(f"💰 *{f['valor']}*")
-    if f.get("prazo"):        lines.append(f"⏱️ {f['prazo']}")
-    if f.get("data"):         lines.append(f"📅 {f['data']}")
-    if f.get("contrato"):     lines.append(f"📄 {f['contrato']}")
+
+    # PRIORITY 4: HOW MUCH (NEVER truncated)
+    if f.get("valor"):      lines.append(f"💰 *{f['valor']}*")
+
+    # PRIORITY 5: WHAT (object — abbreviated)
+    obj = f.get("objeto","")
+    if obj:
+        if len(obj) > 80: obj = obj[:77] + "…"
+        lines.append(f"📦 {obj}")
+
+    # PRIORITY 6: Penalty (for disciplinary)
+    if f.get("penalidade"): lines.append(f"⚖️ *{f['penalidade']}*")
+    if f.get("assunto"):    lines.append(f"📌 {f['assunto'][:60]}")
+
+    # PRIORITY 7: WHEN + references
+    if f.get("data"):       lines.append(f"📅 {f['data']}")
+    if f.get("contrato"):   lines.append(f"📄 {f['contrato'][:40]}")
+    if f.get("prazo"):      lines.append(f"⏱️ {f['prazo'][:30]}")
     if f.get("processo") or f.get("sei"):
         lines.append(f"🔖 {f.get('processo') or f.get('sei')}")
-    if f.get("fundamento"):   lines.append(f"⚖️ {f['fundamento'][:60]}")
-    # MISSING
+    if f.get("modalidade"): lines.append(f"📋 {f['modalidade'][:40]}")
+
+    # MISSING — only for investigative/contract categories
     missing=[]
-    if not f.get("empresa") and not f.get("servidor") and not f.get("interessado"):
-        if cat in ("contrato","licitacao","penalidade","urgencia"):
+    if not empresa and not f.get("servidor") and not f.get("interessado"):
+        if cat in ("contrato","licitacao","penalidade","urgencia","privatizacao"):
             missing.append("Empresa")
-        elif cat in ("disciplinar",):
-            missing.append("Servidor")
     if not f.get("cnpj") and cat in ("contrato","licitacao","penalidade"):
         missing.append("CNPJ")
-    if not f.get("valor") and cat not in ("pessoal","disciplinar","educacao","seguranca"):
+    if not f.get("valor") and cat not in ("pessoal","disciplinar","educacao","seguranca","investigativo"):
         missing.append("Valor")
     if not f.get("processo") and not f.get("sei"):
         missing.append("Processo")
-    if missing: lines.append(f"❓ *Faltando:* {' · '.join(missing)}")
-    lines+=["─"*22,f"🔗 [Portal]({link})"]
+    if missing: lines.append(f"❓ Faltando: {' · '.join(missing)}")
+
+    lines += ["━━━", f"🔗 [Portal]({link})"]
     return "\n".join(lines)
 
 
@@ -624,10 +730,13 @@ def build_summary(results_by_caderno, date_str, pub_counts):
         emp=(f.get("empresa") or f.get("servidor") or "")[:25]
         val=f.get("valor","")[:15]
         org=(ref.get("org") or "")[:20]
-        l=f"{h['veredito'][:2]} {icon} `{ref['keyword'][:25]}` [{ref['label']}]"
-        if org: l+=f" {org}"
-        if emp: l+=f" | {emp}"
-        if val: l+=f" | {val}"
+        city=extract_city(ref.get("path",""), ref.get("label",""))
+        l=f"{h['veredito'][:2]} {icon} `{ref['keyword'][:25]}`"
+        if city: l+=f" 📍{city[:12]}"
+        elif org: l+=f" {org[:20]}"
+        else: l+=f" [{ref['label']}]"
+        if emp: l+=f" | {emp[:25]}"
+        if val: l+=f" | {val[:15]}"
         lines.append(l)
     lines+=["━"*20,f"🔗 [Portal]({PORTAL_URL})"]
     return "\n".join(lines)
