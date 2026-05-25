@@ -525,6 +525,71 @@ def process_caderno(browser, caderno):
         print(f"  [{lbl}] PW error: {e}"); ctx.close()
         return None, {}, None, ""
 
+# ── PAGE INDEX — map publication titles to PDF page numbers ──
+def build_page_index(pdf_bytes, max_pages=500):
+    """Extract text per page. Returns [(page_num, normalized_text), ...]."""
+    try:
+        from pdfminer.high_level import extract_pages
+        from pdfminer.layout import LTTextBox, LAParams
+        lp = LAParams(line_margin=0.3, char_margin=2.0, word_margin=0.1, boxes_flow=None)
+        index = []
+        for i, page in enumerate(extract_pages(io.BytesIO(pdf_bytes), laparams=lp)):
+            if i >= max_pages: break
+            boxes = [el.get_text() for el in page if isinstance(el, LTTextBox) and el.get_text().strip()]
+            page_text = " ".join(boxes)
+            index.append((i + 1, normalize(page_text)))
+        print(f"  Page index: {len(index)} pages")
+        return index
+    except Exception as e:
+        print(f"  Page index err: {e}")
+        return []
+
+def find_page(title, page_index):
+    """Find which PDF page contains this title. Handles line breaks and formatting differences."""
+    if not title or not page_index: return None
+    title_n = normalize(title)
+    # Strategy 1: first 35 chars
+    needle = title_n[:35]
+    if len(needle) >= 10:
+        for pn, pt in page_index:
+            if needle in pt: return pn
+    # Strategy 2: first 20 chars (line breaks can split mid-title)
+    needle = title_n[:20]
+    if len(needle) >= 10:
+        for pn, pt in page_index:
+            if needle in pt: return pn
+    # Strategy 3: key words from title (handles reflow/extra spaces)
+    # Extract significant words (>4 chars, not common prepositions)
+    skip = {"para","como","sobre","entre","desde","estado","maio","junho",
+            "julho","abril","agosto","setembro","outubro","novembro","dezembro",
+            "janeiro","fevereiro","marco","2026","2025","2024"}
+    words = [w for w in re.findall(r"[a-zà-ÿ]{4,}", title_n) if w not in skip]
+    if len(words) >= 3:
+        # Require at least 3 key words on the same page
+        for pn, pt in page_index:
+            matches = sum(1 for w in words[:6] if w in pt)
+            if matches >= min(3, len(words)):
+                return pn
+    return None
+
+def download_pdf_for_pages(session, uuid):
+    """Download PDF using the intercepted UUID. Returns bytes or None."""
+    if not uuid: return None
+    url = f"{PDF_API}/v1/editions/{uuid}"
+    try:
+        r = session.get(url, timeout=120, stream=True)
+        if r.status_code != 200:
+            print(f"  PDF download {r.status_code} for {uuid[:20]}")
+            return None
+        data = b"".join(r.iter_content(65536))
+        if data[:4] != b"%PDF": return None
+        print(f"  PDF: {len(data)/1e6:.1f}MB")
+        return data
+    except Exception as e:
+        print(f"  PDF err: {e}")
+        return None
+
+
 # ── SCAN ──────────────────────────────────────────────────────────
 def scan_publications(pubs, excerpts, dom_text, caderno):
     lbl=caderno["label"]; jn=caderno["journalName"]; rsn=caderno["rootSectionName"]
@@ -652,12 +717,14 @@ def build_ficha(hit, date_str):
     # PRIORITY 1: Government branch (abbreviated, FULL)
     if org: lines.append(f"🏛️ *{org}*")
 
-    # PRIORITY 2: Title (abbreviated if too long)
+    # PRIORITY 2: Title + page
     title = ref.get("title","")
     if title:
         if len(title) > 100:
             title = title[:97] + "…"
         lines.append(f"📄 {title}")
+    if f.get("pagina"):
+        lines.append(f"📖 *{f['pagina']}* do PDF")
 
     # PRIORITY 3: WHO — company/servidor (NEVER truncated)
     empresa = f.get("empresa","")
@@ -731,12 +798,14 @@ def build_summary(results_by_caderno, date_str, pub_counts):
         val=f.get("valor","")[:15]
         org=(ref.get("org") or "")[:20]
         city=extract_city(ref.get("path",""), ref.get("label",""))
+        pg=f.get("pagina","")
         l=f"{h['veredito'][:2]} {icon} `{ref['keyword'][:25]}`"
         if city: l+=f" 📍{city[:12]}"
         elif org: l+=f" {org[:20]}"
         else: l+=f" [{ref['label']}]"
         if emp: l+=f" | {emp[:25]}"
         if val: l+=f" | {val[:15]}"
+        if pg: l+=f" | {pg}"
         lines.append(l)
     lines+=["━"*20,f"🔗 [Portal]({PORTAL_URL})"]
     return "\n".join(lines)
@@ -775,6 +844,12 @@ def main():
     from playwright.sync_api import sync_playwright
     print("  Playwright: ✅\n")
 
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        "Accept":"*/*","Accept-Language":"pt-BR,pt;q=0.9",
+    })
+
     results_by_caderno={}; pub_counts={}
 
     with sync_playwright() as pw:
@@ -804,6 +879,20 @@ def main():
                             "ref":{"keyword":kw,"label":lbl,"journal":caderno["journalName"],
                                    "section":caderno["rootSectionName"],"title":"","path":"","org":"","slug":"","pub_id":""}})
                 pub_counts.setdefault(lbl,0)
+
+            # Add page numbers by matching titles against PDF
+            if hits and pdf_uuid:
+                print(f"  [{lbl}] Downloading PDF for page lookup...")
+                pdf_bytes = download_pdf_for_pages(session, pdf_uuid)
+                if pdf_bytes:
+                    page_index = build_page_index(pdf_bytes)
+                    mapped = 0
+                    for h in hits:
+                        pg = find_page(h["ref"].get("title",""), page_index)
+                        if pg:
+                            h["fields"]["pagina"] = f"p.{pg}"
+                            mapped += 1
+                    print(f"  [{lbl}] Pages mapped: {mapped}/{len(hits)}")
 
             if not hits:
                 send_telegram(f"⚠️ *DOESP {date_str}* — {emo} [{lbl}]\nSem resultados\n🔗 [Verificar]({caderno_url(caderno['journalName'],caderno['rootSectionName'])})")
@@ -836,10 +925,12 @@ def main():
             emp=f.get("empresa","") or f.get("servidor","")
             val=f.get("valor","")
             org=(ref.get("org") or "")[:25]
+            pg=f.get("pagina","")
             l=f"{icon} `{h['keyword'][:25]}` [{ref['label']}]"
             if org: l+=f" {org}"
-            if emp: l+=f" | {emp[:30]}"
-            if val: l+=f" | {val[:20]}"
+            if emp: l+=f" | {emp[:25]}"
+            if val: l+=f" | {val[:15]}"
+            if pg: l+=f" | {pg}"
             lines.append(l)
         send_telegram("\n".join(lines), silent=True)
 
