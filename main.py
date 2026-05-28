@@ -8,10 +8,12 @@ if not TELEGRAM_TOKEN or not CHAT_ID:
     print("FATAL: TELEGRAM_TOKEN ou CHAT_ID ausentes."); sys.exit(1)
 
 CADERNOS = [
-    {"journalName":"Executivo",  "rootSectionName":"Atos Normativos",    "label":"Normativos","emoji":"📋"},
-    {"journalName":"Executivo",  "rootSectionName":"Atos de Pessoal",    "label":"Pessoal",   "emoji":"👤"},
-    {"journalName":"Executivo",  "rootSectionName":"Atos de Gestão e Despesas","label":"Gestão","emoji":"💼"},
-    {"journalName":"Municípios", "rootSectionName":"Atos Municipais",    "label":"Municípios","emoji":"🏛️"},
+    {"journalName":"Executivo",   "rootSectionName":"Atos Normativos",              "label":"Normativos", "emoji":"📋"},
+    {"journalName":"Executivo",   "rootSectionName":"Atos de Pessoal",              "label":"Pessoal",    "emoji":"👤"},
+    {"journalName":"Executivo",   "rootSectionName":"Atos de Gestão e Despesas",    "label":"Gestão",     "emoji":"💼"},
+    {"journalName":"Municípios",  "rootSectionName":"Atos Municipais",              "label":"Municípios", "emoji":"🏛️"},
+    {"journalName":"Legislativo", "rootSectionName":"Atos Legislativos e Parlamentares da Assembleia",
+                                                                                    "label":"Legislativo","emoji":"🏛️"},
 ]
 
 PORTAL_URL = "https://doe.sp.gov.br/sumario"
@@ -114,6 +116,47 @@ KEYWORD_CATEGORIES = {
     "exoneração a pedido":                  "pessoal",
     "exoneração de servidor":               "pessoal",
     "auditoria":                            "investigativo",
+    # ── LICENÇAS AMBIENTAIS (CETESB / SEMIL) ──
+    "licenças concedidas":              "meio_ambiente",   # CETESB bulk publication format
+    "licença de instalação":            "meio_ambiente",   # LAI — highest-value license
+    "licença de operação":              "meio_ambiente",   # LO
+    "licença prévia":                   "meio_ambiente",   # LP
+    "Companhia Ambiental":              "meio_ambiente",   # CETESB full name
+    "auto de infração ambiental":       "meio_ambiente",   # already exists but keep
+    # ── OPERADORAS DE TRANSPORTE (metrô / CPTM / trens) ──
+    "ViaQuatro":                        "privatizacao",    # Line 4-Yellow (CCR)
+    "ViaMobilidade":                    "privatizacao",    # Lines 5, 8, 9, 17 (CCR)
+    "Linha Uni":                        "privatizacao",    # Line 6-Orange (Acciona/CRRC)
+    "Motiva":                           "privatizacao",    # CCR metro brand
+    # ── CONCESSIONÁRIAS RODOVIÁRIAS ──
+    "AutoBan":                          "privatizacao",    # SP-330 + SP-348 (CCR)
+    "SPVias":                           "privatizacao",    # SP-255 (CCR)
+    "ViaOeste":                         "privatizacao",    # SP-270 + SP-280 (CCR)
+    "Ecovias":                          "privatizacao",    # Anchieta-Imigrantes (EcoRodovias)
+    "EcoRodovias":                      "privatizacao",    # highway operator
+    "Eixo SP":                          "privatizacao",    # PiPa concession R$14bi
+    "Rota das Bandeiras":               "privatizacao",    # SP-101/348/360
+    "Intervias":                        "privatizacao",    # SP-330 (Arteris)
+    "Rumo":                             "privatizacao",    # Malha Paulista (freight)
+    "Arteris":                          "privatizacao",    # highway group
+    # ── AGÊNCIAS REGULADORAS ──
+    "ARTESP":                           "privatizacao",    # transport regulator
+    "SP-Águas":                         "privatizacao",    # water regulator (new 2024)
+    # ── ENERGIA / SANEAMENTO ──
+    "CPFL":                             "privatizacao",    # electricity (Piracicaba/Campinas)
+    "Comgás":                           "privatizacao",    # gas distribution (Shell/Cosan)
+    "EMAE":                             "privatizacao",    # electricity (being privatized)
+    "Sabesp":                           "privatizacao",    # water/sewage (partially privatized)
+    "BRK Ambiental":                    "privatizacao",    # water in some municipalities
+    "Aegea":                            "privatizacao",    # water/sewage operator
+    # ── ORGANIZAÇÕES SOCIAIS DE SAÚDE ──
+    "SPDM":                             "saude",           # major hospital OS
+    "Pro-Saúde":                        "saude",           # AME/hospital operator
+    "CEJAM":                            "saude",           # primary care OS
+    "Sírio-Libanês":                    "saude",           # manages public services
+    "SECONCI":                          "saude",           # occupational health OS
+    "Santa Marcelina":                  "saude",           # hospital OS (already in code?)
+
 }
 
 KEYWORDS = sorted(KEYWORD_CATEGORIES.keys(), key=len, reverse=True)
@@ -470,6 +513,7 @@ def extract_publications_from_tree(tree_data):
 def process_caderno(browser, caderno):
     jn=caderno["journalName"]; rsn=caderno["rootSectionName"]; lbl=caderno["label"]
     tree_data=None; pub_excerpts={}; pdf_uuid=None; all_api=[]
+    tree_journal_id=[None]; tree_section_id=[None]  # mutable for closure
 
     def on_response(response):
         nonlocal tree_data, pdf_uuid
@@ -478,7 +522,13 @@ def process_caderno(browser, caderno):
             if response.status==200 and "json" in ct:
                 data=response.json(); all_api.append({"url":url,"data":data})
                 if isinstance(data,dict) and "journalName" in data and "items" in data:
-                    tree_data=data; print(f"    TREE [{url[-55:]}]")
+                    tree_data=data
+                    # Extract journalId and sectionId from URL for pagination
+                    jid_m = re.search(r"JournalId=([0-9a-f-]{36})", url, re.I)
+                    sid_m = re.search(r"SectionId=([0-9a-f-]{36})", url, re.I)
+                    if jid_m: tree_journal_id[0] = jid_m.group(1)
+                    if sid_m: tree_section_id[0] = sid_m.group(1)
+                    print(f"    TREE [{url[-55:]}]")
                 if isinstance(data,dict) and "publications" in data and "pages" in data:
                     for p in data["publications"]:
                         if p.get("id") and p.get("excerpt"):
@@ -518,12 +568,54 @@ def process_caderno(browser, caderno):
         page.wait_for_timeout(6000)
 
         dom_text=page.inner_text("body")
-        print(f"  [{lbl}] DOM={len(dom_text):,}ch tree={'✅' if tree_data else '❌'} pubs={len(pub_excerpts)} pdf={pdf_uuid or '❌'}")
         ctx.close()
+
+        # Fetch additional excerpt pages if we got journal/section IDs
+        if tree_journal_id[0] and tree_section_id[0]:
+            import requests as _req
+            _sess = _req.Session()
+            pub_excerpts = fetch_more_excerpts(
+                _sess, tree_journal_id[0], tree_section_id[0], pub_excerpts, max_pages=4)
+        total_exc = len(pub_excerpts)
+        print(f"  [{lbl}] DOM={len(dom_text):,}ch tree={'✅' if tree_data else '❌'} excerpts={total_exc} pdf={pdf_uuid or '❌'}")
         return tree_data, pub_excerpts, pdf_uuid, dom_text
     except Exception as e:
         print(f"  [{lbl}] PW error: {e}"); ctx.close()
         return None, {}, None, ""
+
+# ── PUBLICATIONS API PAGINATION ─────────────────────────────────
+def fetch_more_excerpts(session, journal_id, section_id, existing_excerpts, max_pages=3):
+    """
+    Try to fetch pages 2-N of the publications API directly to get more excerpts.
+    This catches publications beyond page 1 that may contain important keywords.
+    Returns updated excerpts dict.
+    """
+    excerpts = dict(existing_excerpts)
+    base = "https://do-api-web-search.doe.sp.gov.br/v2/publications"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Referer": "https://doe.sp.gov.br/",
+    }
+    for page in range(2, max_pages + 1):
+        try:
+            url = f"{base}?JournalId={journal_id}&SectionId={section_id}&page={page}&pageSize=25&name=publications"
+            r = session.get(url, headers=headers, timeout=10)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            pubs = data.get("publications", [])
+            if not pubs:
+                break
+            for p in pubs:
+                if p.get("id") and p.get("excerpt"):
+                    excerpts[p["id"]] = p.get("excerpt","")[:500]
+            total_pages = data.get("pages", 1)
+            if page >= total_pages:
+                break
+        except Exception:
+            break
+    return excerpts
 
 # ── PAGE INDEX — map publication titles to PDF page numbers ──
 def build_page_index(pdf_bytes, max_pages=500):
@@ -603,7 +695,9 @@ def scan_publications(pubs, excerpts, dom_text, caderno):
             title_low=normalize(pub["title"])
             exc_text=excerpts.get(pub["id"],"")
             exc_low=normalize(exc_text)
-            searchable=title_low+" "+exc_low
+            # Include org path in searchable — catches org-name keywords (CETESB, ARTESP etc.)
+            path_low=normalize(pub.get("path",""))
+            searchable=title_low+" "+exc_low+" "+path_low
 
             if kn not in searchable: continue
             # Dedup by keyword + org path (not pub_id) to avoid 8 identical cards
@@ -666,7 +760,9 @@ def tv_score(text_low, keyword, text_raw, fields):
     if any(t in text_low for t in ["escola estadual","merenda","alimentação escolar"]): score+=2; fatores.append("EDUCAÇÃO")
     if any(t in text_low for t in ["unidade prisional","policial penal","penitenciária"]): score+=1; fatores.append("PENITENCIÁRIO")
     if any(t in text_low for t in ["demissão","suspensão por","aposentadoria compulsória"]): score+=2; fatores.append("SANÇÃO")
-    if any(t in text_low for t in ["sabesp","metrô","cptm","dersa","trem intercidades"]): score+=2; fatores.append("INFRAESTRUTURA")
+    if any(t in text_low for t in ["sabesp","metro","cptm","dersa","trem intercidades",
+                                        "viaquatro","viamobilidade","linha uni","autoban","ecovias",
+                                        "viaeste","rota das bandeiras","eixo sp","rumo","comgas","emae"]): score+=2; fatores.append("INFRAESTRUTURA")
     if any(t in text_low for t in ["cetesb","contaminada","embargo"]): score+=1; fatores.append("AMBIENTAL")
     if any(t in text_low for t in ["privatização","desestatização","concessão"]): score+=2; fatores.append("PRIVATIZAÇÃO")
     if any(t in text_low for t in ["renúncia fiscal","benefício fiscal","isenção de icms"]): score+=3; fatores.append("FISCAL")
