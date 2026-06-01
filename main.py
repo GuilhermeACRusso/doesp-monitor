@@ -740,11 +740,63 @@ def passes_filter(kw, text_low, text_raw):
         if m and 0<parse_brl(m.group(0))<mv: return False
     return True
 
+
+# ── CITIZEN IMPACT WEIGHTS (Kovach Ch.6+8) ──────────────────────
+# "The watchdog principle extends to all powerful institutions"
+# "Make the significant interesting and RELEVANT to citizens"
+_CITIZEN_IMPACT = {
+    # Tier 1 — directly affects citizen wellbeing
+    "urgencia":      (5, "Serviço público em emergência — cidadão pode ser afetado diretamente"),
+    "saude":         (4, "Contratos ou decisões sobre saúde pública"),
+    "investigativo": (4, "Possível irregularidade com dinheiro público"),
+    "privatizacao":  (4, "Mudança em serviço público essencial — impacto em tarifas e acesso"),
+    "fiscal":        (4, "Impacto no orçamento — afeta investimentos em saúde e educação"),
+    # Tier 2 — affects citizens indirectly
+    "obras":         (3, "Obra pública com recursos de impostos"),
+    "educacao":      (3, "Educação pública — qualidade e acesso"),
+    "seguranca":     (3, "Segurança pública — proteção da população"),
+    "licitacao":     (2, "Processo que define quem presta serviços ao governo"),
+    "contrato":      (2, "Compromisso financeiro do Estado"),
+    "disciplinar":   (2, "Responsabilização de servidor público"),
+    "penalidade":    (2, "Sanção por falha na execução contratual"),
+    "legal":         (2, "Decisão com impacto em direitos ou obrigações"),
+    "meio_ambiente": (2, "Impacto ambiental na qualidade de vida"),
+    # Tier 3 — institutional routine
+    "orcamento":     (1, "Ajuste orçamentário"),
+    "pessoal":       (1, "Movimentação de pessoal no serviço público"),
+    "general":       (1, "Ato administrativo"),
+}
+
+# Watchdog questions per category (Kovach Ch.6 — conscience of watchdog function)
+_WATCHDOG_QUESTIONS = {
+    "urgencia":      "Verificar: qual a justificativa para dispensar licitação?",
+    "saude":         "Verificar: empresa tem histórico de contratos com o estado?",
+    "investigativo": "Verificar: abrir pedido LAI para documentos completos",
+    "privatizacao":  "Verificar: impacto tarifário foi divulgado?",
+    "fiscal":        "Verificar: beneficiários estão no Portal da Transparência?",
+    "obras":         "Verificar: licitação foi publicada? Empresa é idônea?",
+    "licitacao":     "Verificar: edital completo disponível no DOESP ou e-negócios?",
+    "contrato":      "Verificar: CNPJ no portal de sanções (CEIS/CNIA)?",
+    "disciplinar":   "Verificar: processo é público? Quais foram as irregularidades?",
+}
+
+def citizen_impact(cat):
+    """Kovach Ch.8: why this act matters for the citizen."""
+    w, desc = _CITIZEN_IMPACT.get(cat, (1,""))
+    return w, desc
+
+def watchdog_question(cat):
+    """Kovach Ch.6+10: the specific watchdog question for this category."""
+    return _WATCHDOG_QUESTIONS.get(cat, "")
+
 # ── TV SCORING ────────────────────────────────────────────────────
 def tv_score(text_low, keyword, text_raw, fields):
     cat=KEYWORD_CATEGORIES.get(keyword,"general")
     tier=CATEGORY_TV.get(cat,(3,"",""))[0]
-    score={1:4,2:2,3:0}.get(tier,0); fatores=[]
+    # Base score: tier + citizen impact weight (Kovach Ch.8 — relevance to citizens)
+    citizen_w, _ = citizen_impact(cat)
+    score = {1:4,2:2,3:0}.get(tier,0) + (citizen_w - 1)  # add 0-4 bonus
+    fatores=[]
 
     val=fields.get("valor","")
     if val:
@@ -855,18 +907,27 @@ def build_ficha(hit, date_str):
         lines.append(f"🔖 {f.get('processo') or f.get('sei')}")
     if f.get("modalidade"): lines.append(f"📋 {f['modalidade'][:40]}")
 
-    # MISSING — only for investigative/contract categories
-    missing=[]
+    # ── Lacunas com framing de vigilância (Kovach Ch.6 — watchdog) ──
+    # Not just "missing fields" but specific accountability questions
+    lacunas = []
     if not empresa and not f.get("servidor") and not f.get("interessado"):
         if cat in ("contrato","licitacao","penalidade","urgencia","privatizacao"):
-            missing.append("Empresa")
-    if not f.get("cnpj") and cat in ("contrato","licitacao","penalidade"):
-        missing.append("CNPJ")
+            lacunas.append("❓ Sem empresa — buscar no PDF original")
+    if not f.get("cnpj") and cat in ("contrato","licitacao","penalidade","urgencia"):
+        lacunas.append("❓ Sem CNPJ — verificar idoneidade (CEIS/CNIA/TCU)")
     if not f.get("valor") and cat not in ("pessoal","disciplinar","educacao","seguranca","investigativo"):
-        missing.append("Valor")
-    if not f.get("processo") and not f.get("sei"):
-        missing.append("Processo")
-    if missing: lines.append(f"❓ Faltando: {' · '.join(missing)}")
+        lacunas.append("❓ Sem valor — exigido por lei (Lei 14.133, art.88)")
+    if not f.get("processo") and not f.get("sei") and cat in ("contrato","licitacao","urgencia","disciplinar"):
+        lacunas.append("❓ Sem nº processo — dificulta rastreamento público")
+    for l in lacunas: lines.append(l)
+
+    # ── Civic impact + watchdog question (Kovach Ch.8+6) ──
+    _, impact_desc = citizen_impact(cat)
+    wq = watchdog_question(cat)
+    if impact_desc or wq:
+        lines.append("━━━")
+        if impact_desc: lines.append(f"ℹ️ _{impact_desc}_")
+        if wq:          lines.append(f"🔍 _{wq}_")
 
     lines += ["━━━", f"🔗 [Portal]({link})"]
     return "\n".join(lines)
