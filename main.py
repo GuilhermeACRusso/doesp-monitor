@@ -95,6 +95,10 @@ KEYWORD_CATEGORIES = {
     "decisão judicial":                     "legal",
     # ── TIER 2: EDUCAÇÃO ──
     "merenda escolar":                      "educacao",
+    # Copa do Mundo / FIFA dispensa escolar
+    "Copa do Mundo":                        "educacao",
+    "dispensa de atividades escolares":     "educacao",
+    "FIFA":                                 "educacao",
     "transporte escolar":                   "educacao",
     "construção de escola estadual":        "educacao",
     "fechamento de escola":                 "educacao",
