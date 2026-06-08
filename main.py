@@ -968,8 +968,59 @@ def build_summary(results_by_caderno, date_str, pub_counts):
         if val: l+=f" | {val[:15]}"
         if pg: l+=f" | {pg}"
         lines.append(l)
+    # Coverage gap report (Kovach Ch.9 — proportionality + completeness)
+    covered_cats = {KEYWORD_CATEGORIES.get(h["ref"]["keyword"],"") for h in all_h}
+    important    = {"urgencia","saude","privatizacao","investigativo","fiscal",
+                    "obras","educacao","meio_ambiente"}
+    gaps = important - covered_cats
+    if gaps:
+        lines.append(f"_Sem publicações prioritárias: {', '.join(sorted(gaps))}_")
+
+    # Anomaly report (Kovach Ch.4+6 — patterns across hits)
+    anomalies = detect_doesp_anomalies(all_h)
+    if anomalies:
+        lines.append("━"*20)
+        for a in anomalies[:3]:
+            lines.append(a)
+
     lines+=["━"*20,f"🔗 [Portal]({PORTAL_URL})"]
     return "\n".join(lines)
+
+
+# ── ANOMALY DETECTION (Kovach Ch.4+6) ──────────────────────────────
+def detect_doesp_anomalies(all_hits):
+    """
+    Cross-check patterns across all DOESP hits for the day.
+    Kovach: "Seeking multiple witnesses" = looking at patterns, not just individual acts.
+    """
+    anomalies = []
+    # 1. Repeat companies
+    emp_count = {}
+    for h in all_hits:
+        emp = h["fields"].get("empresa","")
+        if emp and len(emp) > 5:
+            emp_count.setdefault(emp[:40], []).append(h)
+    for emp, hits in emp_count.items():
+        if len(hits) >= 3:
+            total = sum(parse_brl(h["fields"].get("valor","")) for h in hits)
+            anomalies.append(
+                f"⚠️ *Empresa recorrente:* {emp} — {len(hits)} publicações"
+                + (f" (total R$ {total:,.0f})" if total else ""))
+
+    # 2. Multiple emergencies
+    emerg = [h for h in all_hits if "emergencial" in normalize(h.get("keyword",""))]
+    if len(emerg) >= 2:
+        anomalies.append(f"⚠️ *{len(emerg)} contratações emergenciais* no mesmo dia")
+
+    # 3. Same keyword flooding (proportionality signal)
+    kw_count = {}
+    for h in all_hits:
+        kw_count[h["keyword"]] = kw_count.get(h["keyword"],0) + 1
+    for kw, n in kw_count.items():
+        if n >= 8:
+            anomalies.append(f"⚠️ *Concentração:* {n}× '{kw}' — verificar se há padrão")
+
+    return anomalies
 
 # ── TELEGRAM ──────────────────────────────────────────────────────
 _last_send=0.0
